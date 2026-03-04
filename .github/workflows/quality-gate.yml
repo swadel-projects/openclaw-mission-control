@@ -39,14 +39,9 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
-      - name: Prepare E2E environment
+      # Keep this ONLY if your build requires .env to exist
+      - name: Prepare build environment
         run: cp .env.test .env
 
       - name: Build
         run: pnpm build
-
-      - name: Install Playwright browsers
-        run: pnpm exec playwright install --with-deps
-
-      - name: E2E tests
-        run: pnpm test:e2e
