@@ -2,6 +2,9 @@
 
 import { useState, useEffect } from 'react'
 import { useMissionControl } from '@/store'
+import { createClientLogger } from '@/lib/client-logger'
+
+const log = createClientLogger('AgentSpawnPanel')
 
 interface SpawnFormData {
   task: string
@@ -44,6 +47,7 @@ export function AgentSpawnPanel() {
         setModelsState('ready')
       })
       .catch(() => setModelsState('error'))
+      .catch(err => log.error('Failed to load spawn history:', err))
   }, [])
 
   // Default-select first model once loaded
@@ -112,7 +116,7 @@ export function AgentSpawnPanel() {
         })
       }
     } catch (error) {
-      console.error('Spawn error:', error)
+      log.error('Spawn error:', error)
       updateSpawnRequest(spawnId, {
         status: 'failed',
         error: error instanceof Error ? error.message : 'Network error'

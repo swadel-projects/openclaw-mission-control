@@ -83,6 +83,7 @@ See `.env.example` for the full list. Key variables:
 |----------|----------|---------|-------------|
 | `AUTH_USER` | Yes | `admin` | Admin username (seeded on first run) |
 | `AUTH_PASS` | Yes | - | Admin password |
+| `AUTH_PASS_B64` | No | - | Base64-encoded admin password (overrides `AUTH_PASS` if set) |
 | `API_KEY` | Yes | - | API key for headless access |
 | `PORT` | No | `3005` (direct) / `3000` (Docker) | Server port |
 | `OPENCLAW_HOME` | No | - | Path to OpenClaw installation |
@@ -99,6 +100,21 @@ rm -rf node_modules
 pnpm install
 ```
 
+### AUTH_PASS with "#" is not working
+
+In dotenv files, `#` starts a comment unless the value is quoted.
+
+Use one of these:
+- `AUTH_PASS="my#password"`
+- `AUTH_PASS_B64=$(echo -n 'my#password' | base64)`
+
+### "pnpm-lock.yaml not found" during Docker build
+
+If your deployment context omits `pnpm-lock.yaml`, Docker build now falls back to
+`pnpm install --no-frozen-lockfile`.
+
+For reproducible builds, include `pnpm-lock.yaml` in the build context.
+
 ### "Invalid ELF header" or "Mach-O" errors
 
 The native binary was compiled on a different platform. Rebuild:
@@ -111,3 +127,25 @@ pnpm build
 ### Database locked errors
 
 Ensure only one instance is running against the same `.data/` directory. SQLite uses WAL mode but does not support multiple writers.
+
+### "Gateway error: origin not allowed"
+
+Your gateway is rejecting the Mission Control browser origin. Add the Control UI origin
+to your gateway config allowlist, for example:
+
+```json
+{
+  "gateway": {
+    "controlUi": {
+      "allowedOrigins": ["http://YOUR_HOST:3000"]
+    }
+  }
+}
+```
+
+Then restart the gateway and reconnect from Mission Control.
+
+### "Gateway error: device identity required"
+
+Device identity signing uses WebCrypto and requires a secure browser context.
+Open Mission Control over HTTPS (or localhost), then reconnect.

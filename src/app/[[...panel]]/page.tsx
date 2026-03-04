@@ -30,11 +30,13 @@ import { IntegrationsPanel } from '@/components/panels/integrations-panel'
 import { AlertRulesPanel } from '@/components/panels/alert-rules-panel'
 import { MultiGatewayPanel } from '@/components/panels/multi-gateway-panel'
 import { SuperAdminPanel } from '@/components/panels/super-admin-panel'
+import { OfficePanel } from '@/components/panels/office-panel'
 import { GitHubSyncPanel } from '@/components/panels/github-sync-panel'
 import { ChatPanel } from '@/components/chat/chat-panel'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { LocalModeBanner } from '@/components/layout/local-mode-banner'
 import { UpdateBanner } from '@/components/layout/update-banner'
+import { PromoBanner } from '@/components/layout/promo-banner'
 import { useWebSocket } from '@/lib/websocket'
 import { useServerEvents } from '@/lib/use-server-events'
 import { useMissionControl } from '@/store'
@@ -138,6 +140,9 @@ export default function Home() {
 
   return (
     <div className="flex h-screen bg-background overflow-hidden">
+      <a href="#main-content" className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-2 focus:left-2 focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-md focus:text-sm focus:font-medium">
+        Skip to main content
+      </a>
       {/* Left: Icon rail navigation (hidden on mobile, shown as bottom bar instead) */}
       <NavRail />
 
@@ -146,7 +151,8 @@ export default function Home() {
         <HeaderBar />
         <LocalModeBanner />
         <UpdateBanner />
-        <main className="flex-1 overflow-auto pb-16 md:pb-0" role="main">
+        <PromoBanner />
+        <main id="main-content" className="flex-1 overflow-auto pb-16 md:pb-0" role="main">
           <div aria-live="polite">
             <ErrorBoundary key={activeTab}>
               <ContentRouter tab={activeTab} />
@@ -251,7 +257,11 @@ function ContentRouter({ tab }: { tab: string }) {
       return <SettingsPanel />
     case 'github':
       return <GitHubSyncPanel />
+    case 'office':
+      return <OfficePanel />
     case 'super-admin':
+      return <SuperAdminPanel />
+    case 'workspaces':
       return <SuperAdminPanel />
     default:
       return <Dashboard />

@@ -8,7 +8,7 @@
 import { config } from './config'
 import { getDatabase, db_helpers, logAuditEvent } from './db'
 import { eventBus } from './event-bus'
-import { join } from 'path'
+import { join, isAbsolute, resolve } from 'path'
 import { existsSync, readFileSync } from 'fs'
 import { resolveWithin } from './paths'
 import { logger } from './logger'
@@ -127,28 +127,22 @@ function parseToolsFromFile(content: string): { allow?: string[]; raw?: string }
 }
 
 function getConfigPath(): string | null {
-  const explicit =
-    process.env.OPENCLAW_CONFIG_PATH ||
-    process.env.MISSION_CONTROL_OPENCLAW_CONFIG_PATH
+  return config.openclawConfigPath || null
+}
 
-  if (explicit && explicit.trim()) return explicit.trim()
-
-  if (!config.openclawHome) return null
-
-  // Default (linux/mac style)
-  const direct = join(config.openclawHome, 'openclaw.json')
-  if (existsSync(direct)) return direct
-
-  // Windows OpenClaw default: OPENCLAW_HOME points at the user home and the config lives under .openclaw/
-  const dotOpenclaw = join(config.openclawHome, '.openclaw', 'openclaw.json')
-  return dotOpenclaw
+function resolveAgentWorkspacePath(workspace: string): string {
+  if (isAbsolute(workspace)) return resolve(workspace)
+  if (!config.openclawStateDir) {
+    throw new Error('OPENCLAW_STATE_DIR not configured')
+  }
+  return resolveWithin(config.openclawStateDir, workspace)
 }
 
 /** Safely read a file from an agent's workspace directory */
 function readWorkspaceFile(workspace: string | undefined, filename: string): string | null {
-  if (!workspace || !config.openclawHome) return null
+  if (!workspace) return null
   try {
-    const safeWorkspace = resolveWithin(config.openclawHome, workspace)
+    const safeWorkspace = resolveAgentWorkspacePath(workspace)
     const safePath = resolveWithin(safeWorkspace, filename)
     if (existsSync(safePath)) {
       return readFileSync(safePath, 'utf-8')
@@ -186,7 +180,7 @@ export function enrichAgentConfigFromWorkspace(configData: any): any {
 /** Read and parse openclaw.json agents list */
 async function readOpenClawAgents(): Promise<OpenClawAgent[]> {
   const configPath = getConfigPath()
-  if (!configPath) throw new Error('OPENCLAW_HOME not configured')
+  if (!configPath) throw new Error('OPENCLAW_CONFIG_PATH not configured')
 
   const { readFile } = require('fs/promises')
   const raw = await readFile(configPath, 'utf-8')
@@ -371,7 +365,7 @@ export async function previewSyncDiff(): Promise<SyncDiff> {
 /** Write an agent config back to openclaw.json agents.list */
 export async function writeAgentToConfig(agentConfig: any): Promise<void> {
   const configPath = getConfigPath()
-  if (!configPath) throw new Error('OPENCLAW_HOME not configured')
+  if (!configPath) throw new Error('OPENCLAW_CONFIG_PATH not configured')
 
   const { readFile, writeFile } = require('fs/promises')
   const raw = await readFile(configPath, 'utf-8')
