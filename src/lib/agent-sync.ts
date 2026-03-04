@@ -194,6 +194,30 @@ async function readOpenClawAgents(): Promise<OpenClawAgent[]> {
   return parsed?.agents?.list || []
 }
 
+/** Collect all unique model IDs from agents in openclaw.json (primary + fallbacks). */
+export async function readConfiguredModels(): Promise<{ models: string[]; warning?: string }> {
+  const configPath = getConfigPath()
+  if (!configPath) {
+    logger.warn('readConfiguredModels: no config path resolved')
+    return { models: [], warning: 'OPENCLAW_CONFIG_PATH not configured' }
+  }
+  try {
+    const { readFile } = require('fs/promises')
+    const raw = await readFile(configPath, 'utf-8')
+    const parsed = JSON.parse(raw)
+    const agents: OpenClawAgent[] = parsed?.agents?.list || []
+    const seen = new Set<string>()
+    for (const agent of agents) {
+      if (agent.model?.primary) seen.add(agent.model.primary)
+      for (const fb of agent.model?.fallbacks ?? []) seen.add(fb)
+    }
+    return { models: [...seen].sort() }
+  } catch (err: unknown) {
+    logger.warn({ err, configPath }, 'readConfiguredModels: failed to read config')
+    return { models: [], warning: 'Could not read openclaw.json' }
+  }
+}
+
 /** Extract MC-friendly fields from an OpenClaw agent config */
 function mapAgentToMC(agent: OpenClawAgent): {
   name: string

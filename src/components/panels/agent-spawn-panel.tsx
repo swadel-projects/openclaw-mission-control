@@ -11,22 +11,23 @@ interface SpawnFormData {
 }
 
 export function AgentSpawnPanel() {
-  const { 
-    availableModels, 
-    spawnRequests, 
-    addSpawnRequest, 
-    updateSpawnRequest 
+  const {
+    spawnRequests,
+    addSpawnRequest,
+    updateSpawnRequest
   } = useMissionControl()
 
   const [formData, setFormData] = useState<SpawnFormData>({
     task: '',
-    model: 'sonnet',
+    model: '',
     label: '',
     timeoutSeconds: 300
   })
 
   const [isSpawning, setIsSpawning] = useState(false)
   const [spawnHistory, setSpawnHistory] = useState<any[]>([])
+  const [configModels, setConfigModels] = useState<string[]>([])
+  const [modelsState, setModelsState] = useState<'loading' | 'ready' | 'error'>('loading')
 
   useEffect(() => {
     // Load spawn history on mount
@@ -34,7 +35,23 @@ export function AgentSpawnPanel() {
       .then(res => res.json())
       .then(data => setSpawnHistory(data.history || []))
       .catch(err => console.error('Failed to load spawn history:', err))
+
+    // Load models from openclaw.json
+    fetch('/api/spawn?action=models')
+      .then(res => res.json())
+      .then(data => {
+        setConfigModels(data.models ?? [])
+        setModelsState('ready')
+      })
+      .catch(() => setModelsState('error'))
   }, [])
+
+  // Default-select first model once loaded
+  useEffect(() => {
+    if (modelsState === 'ready' && configModels.length > 0 && !formData.model) {
+      setFormData(prev => ({ ...prev, model: configModels[0] }))
+    }
+  }, [modelsState, configModels, formData.model])
 
   const handleSpawn = async () => {
     if (!formData.task.trim() || !formData.label.trim()) {
@@ -45,7 +62,7 @@ export function AgentSpawnPanel() {
     setIsSpawning(true)
 
     const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
-    
+
     // Add to store immediately
     addSpawnRequest({
       id: spawnId,
@@ -75,10 +92,10 @@ export function AgentSpawnPanel() {
           result: result.sessionInfo || 'Agent spawned successfully'
         })
 
-        // Clear form
+        // Clear form (keep first model selected)
         setFormData({
           task: '',
-          model: 'sonnet',
+          model: configModels[0] ?? '',
           label: '',
           timeoutSeconds: 300
         })
@@ -105,8 +122,6 @@ export function AgentSpawnPanel() {
     }
   }
 
-  const selectedModel = availableModels.find(m => m.alias === formData.model)
-
   return (
     <div className="p-6 space-y-6">
       <div className="border-b border-border pb-4">
@@ -120,7 +135,7 @@ export function AgentSpawnPanel() {
         {/* Spawn Form */}
         <div className="bg-card border border-border rounded-lg p-6">
           <h2 className="text-xl font-semibold mb-4">Spawn New Agent</h2>
-          
+
           <div className="space-y-4">
             {/* Task Input */}
             <div>
@@ -145,19 +160,23 @@ export function AgentSpawnPanel() {
                 value={formData.model}
                 onChange={(e) => setFormData(prev => ({ ...prev, model: e.target.value }))}
                 className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
-                disabled={isSpawning}
+                disabled={isSpawning || modelsState !== 'ready' || configModels.length === 0}
               >
-                {availableModels.map((model) => (
-                  <option key={model.alias} value={model.alias}>
-                    {model.alias} - {model.description}
-                  </option>
-                ))}
+                {modelsState === 'loading' && <option value="">Loading models…</option>}
+                {modelsState === 'error' && <option value="">Could not load models — check config path</option>}
+                {modelsState === 'ready' && configModels.length === 0 && (
+                  <option value="">No models configured in openclaw.json</option>
+                )}
+                {configModels.map((id) => {
+                  const slash = id.indexOf('/')
+                  const label = slash >= 0 ? `${id.slice(slash + 1)} · ${id.slice(0, slash)}` : id
+                  return <option key={id} value={id}>{label}</option>
+                })}
               </select>
-              {selectedModel && (
-                <div className="mt-2 text-sm text-muted-foreground">
-                  <div>Provider: {selectedModel.provider}</div>
-                  <div>Cost: ${selectedModel.costPer1k}/1k tokens</div>
-                </div>
+              {modelsState === 'ready' && configModels.length === 0 && (
+                <p className="mt-1 text-sm text-yellow-500">
+                  Add model entries to your openclaw.json to enable spawning.
+                </p>
               )}
             </div>
 
@@ -198,7 +217,7 @@ export function AgentSpawnPanel() {
             {/* Spawn Button */}
             <button
               onClick={handleSpawn}
-              disabled={isSpawning || !formData.task.trim() || !formData.label.trim()}
+              disabled={isSpawning || !formData.task.trim() || !formData.label.trim() || !formData.model}
               className="w-full px-4 py-2 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {isSpawning ? 'Spawning Agent...' : 'Spawn Agent'}
@@ -209,7 +228,7 @@ export function AgentSpawnPanel() {
         {/* Active Spawn Requests */}
         <div className="bg-card border border-border rounded-lg p-6">
           <h2 className="text-xl font-semibold mb-4">Active Requests</h2>
-          
+
           <div className="space-y-3 max-h-96 overflow-y-auto">
             {spawnRequests.length === 0 ? (
               <div className="text-center text-muted-foreground py-8">
@@ -258,7 +277,7 @@ export function AgentSpawnPanel() {
       {spawnHistory.length > 0 && (
         <div className="bg-card border border-border rounded-lg p-6">
           <h2 className="text-xl font-semibold mb-4">Recent Spawn History</h2>
-          
+
           <div className="space-y-2 max-h-64 overflow-y-auto">
             {spawnHistory.map((item, index) => (
               <div key={index} className="flex items-center justify-between p-3 border border-border rounded">

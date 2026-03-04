@@ -7,6 +7,7 @@ import { join } from 'path'
 import { heavyLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateBody, spawnAgentSchema } from '@/lib/validation'
+import { readConfiguredModels } from '@/lib/agent-sync'
 
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'operator')
@@ -97,6 +98,12 @@ export async function GET(request: NextRequest) {
 
   try {
     const { searchParams } = new URL(request.url)
+
+    if (searchParams.get('action') === 'models') {
+      const result = await readConfiguredModels()
+      return NextResponse.json(result)
+    }
+
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200)
 
     // In a real implementation, you'd store spawn history in a database
