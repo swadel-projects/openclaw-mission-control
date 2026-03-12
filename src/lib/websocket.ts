@@ -1,26 +1,35 @@
 'use client'
 
-import { useCallback, useRef, useEffect } from 'react'
+import { useCallback, useEffect } from 'react'
 import { useMissionControl } from '@/store'
 import { normalizeModel } from '@/lib/utils'
+import { buildGatewayWebSocketUrl } from '@/lib/gateway-url'
 import {
   getOrCreateDeviceIdentity,
   signPayload,
   getCachedDeviceToken,
   cacheDeviceToken,
+  clearDeviceIdentity,
 } from '@/lib/device-identity'
 import { APP_VERSION } from '@/lib/version'
 import { createClientLogger } from '@/lib/client-logger'
+import {
+  ConnectErrorDetailCodes,
+  readErrorDetailCode,
+  NON_RETRYABLE_ERROR_CODES,
+  shouldRetryWithoutDeviceIdentity,
+} from '@/lib/websocket-utils'
 
 const log = createClientLogger('WebSocket')
 
 // Gateway protocol version (v3 required by OpenClaw 2026.x)
 const PROTOCOL_VERSION = 3
-const DEFAULT_GATEWAY_CLIENT_ID = process.env.NEXT_PUBLIC_GATEWAY_CLIENT_ID || 'control-ui'
+const DEFAULT_GATEWAY_CLIENT_ID = process.env.NEXT_PUBLIC_GATEWAY_CLIENT_ID || 'openclaw-control-ui'
 
 // Heartbeat configuration
 const PING_INTERVAL_MS = 30_000
 const MAX_MISSED_PONGS = 3
+const ERROR_LOG_DEDUPE_MS = 5_000
 
 // Gateway message types
 interface GatewayFrame {
@@ -31,8 +40,9 @@ interface GatewayFrame {
   payload?: any
   ok?: boolean
   result?: any
-  error?: any
+  error?: { message?: string; code?: string; details?: any; [key: string]: any }
   params?: any
+  seq?: number
 }
 
 interface GatewayMessage {
@@ -41,24 +51,29 @@ interface GatewayMessage {
   timestamp?: number
 }
 
-export function useWebSocket() {
-  const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined)
-  const pingIntervalRef = useRef<NodeJS.Timeout | undefined>(undefined)
-  const maxReconnectAttempts = 10
-  const reconnectUrl = useRef<string>('')
-  const authTokenRef = useRef<string>('')
-  const requestIdRef = useRef<number>(0)
-  const handshakeCompleteRef = useRef<boolean>(false)
-  const reconnectAttemptsRef = useRef<number>(0)
-  const manualDisconnectRef = useRef<boolean>(false)
-  const nonRetryableErrorRef = useRef<string | null>(null)
-  const connectRef = useRef<(url: string, token?: string) => void>(() => {})
+// Shared websocket singleton state across hook mounts.
+const wsRef: { current: WebSocket | null } = { current: null }
+const reconnectTimeoutRef: { current: NodeJS.Timeout | undefined } = { current: undefined }
+const pingIntervalRef: { current: NodeJS.Timeout | undefined } = { current: undefined }
+const reconnectUrl: { current: string } = { current: '' }
+const authTokenRef: { current: string } = { current: '' }
+const requestIdRef: { current: number } = { current: 0 }
+const handshakeCompleteRef: { current: boolean } = { current: false }
+const reconnectAttemptsRef: { current: number } = { current: 0 }
+const manualDisconnectRef: { current: boolean } = { current: false }
+const nonRetryableErrorRef: { current: string | null } = { current: null }
+const connectRef: { current: (url: string, token?: string) => void } = { current: () => {} }
+const lastWebSocketErrorRef: { current: { message: string; at: number } | null } = { current: null }
+const pingCounterRef: { current: number } = { current: 0 }
+const pingSentTimestamps: { current: Map<string, number> } = { current: new Map() }
+const missedPongsRef: { current: number } = { current: 0 }
+const gatewaySupportsPingRef: { current: boolean } = { current: true }
+const lastSeqRef: { current: number | null } = { current: null }
+const tokenOnlyFallbackRef: { current: boolean } = { current: false }
+const tokenOnlyFallbackTriedRef: { current: boolean } = { current: false }
 
-  // Heartbeat tracking
-  const pingCounterRef = useRef<number>(0)
-  const pingSentTimestamps = useRef<Map<string, number>>(new Map())
-  const missedPongsRef = useRef<number>(0)
+export function useWebSocket() {
+  const maxReconnectAttempts = 10
 
   const {
     connection,
@@ -72,15 +87,25 @@ export function useWebSocket() {
     addChatMessage,
     addNotification,
     updateAgent,
-    agents,
+    addExecApproval,
+    updateExecApproval,
   } = useMissionControl()
 
-  const isNonRetryableGatewayError = useCallback((message: string): boolean => {
+  const isNonRetryableGatewayError = useCallback((message: string, error?: GatewayFrame['error']): boolean => {
+    // Prefer structured error code when available (newer gateways)
+    const code = readErrorDetailCode(error)
+    if (code && NON_RETRYABLE_ERROR_CODES.has(code)) return true
+
+    // Fallback: string matching for older gateways without structured codes
     const normalized = message.toLowerCase()
     return (
       normalized.includes('origin not allowed') ||
       normalized.includes('device identity required') ||
+      normalized.includes('requires device identity') ||
+      normalized.includes('secure context') ||
       normalized.includes('device_auth_signature_invalid') ||
+      normalized.includes('invalid connect params') ||
+      normalized.includes('/client/id') ||
       normalized.includes('auth rate limit') ||
       normalized.includes('rate limited')
     )
@@ -92,11 +117,18 @@ export function useWebSocket() {
       const origin = typeof window !== 'undefined' ? window.location.origin : '<control-ui-origin>'
       return `Gateway rejected browser origin. Add ${origin} to gateway.controlUi.allowedOrigins on the gateway, then reconnect.`
     }
-    if (normalized.includes('device identity required')) {
+    if (
+      normalized.includes('device identity required') ||
+      normalized.includes('requires device identity') ||
+      normalized.includes('secure context')
+    ) {
       return 'Gateway requires device identity. Open Mission Control via HTTPS (or localhost), then reconnect so WebCrypto signing can run.'
     }
     if (normalized.includes('device_auth_signature_invalid')) {
       return 'Gateway rejected device signature. Clear local device identity in the browser and reconnect.'
+    }
+    if (normalized.includes('invalid connect params') || normalized.includes('/client/id')) {
+      return 'Gateway rejected client identity params. Ensure NEXT_PUBLIC_GATEWAY_CLIENT_ID is set to openclaw-control-ui and reconnect.'
     }
     if (normalized.includes('auth rate limit') || normalized.includes('rate limited')) {
       return 'Gateway authentication is rate limited. Wait briefly, then reconnect.'
@@ -116,6 +148,7 @@ export function useWebSocket() {
 
     pingIntervalRef.current = setInterval(() => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !handshakeCompleteRef.current) return
+      if (!gatewaySupportsPingRef.current) return
 
       // Check missed pongs
       if (missedPongsRef.current >= MAX_MISSED_PONGS) {
@@ -134,6 +167,13 @@ export function useWebSocket() {
 
       pingCounterRef.current += 1
       const pingId = `ping-${pingCounterRef.current}`
+
+      // Cap map size to prevent unbounded growth if pongs are never received
+      if (pingSentTimestamps.current.size >= 10) {
+        const oldest = pingSentTimestamps.current.keys().next().value
+        if (oldest !== undefined) pingSentTimestamps.current.delete(oldest)
+      }
+
       pingSentTimestamps.current.set(pingId, Date.now())
       missedPongsRef.current += 1
 
@@ -190,7 +230,7 @@ export function useWebSocket() {
     const authToken = authTokenRef.current || undefined
     const tokenForSignature = authToken ?? cachedToken ?? ''
 
-    if (nonce) {
+    if (nonce && !tokenOnlyFallbackRef.current) {
       try {
         const identity = await getOrCreateDeviceIdentity()
         const signedAt = Date.now()
@@ -237,9 +277,10 @@ export function useWebSocket() {
         },
         role,
         scopes,
+        caps: ['tool-events'],
         auth: authToken ? { token: authToken } : undefined,
         device,
-        deviceToken: cachedToken || undefined,
+        deviceToken: tokenOnlyFallbackRef.current ? undefined : (cachedToken || undefined),
       }
     }
     log.info('Sending connect handshake')
@@ -358,6 +399,13 @@ export function useWebSocket() {
 
     // Handle pong responses (any response to a ping ID counts — even errors prove the connection is alive)
     if (frame.type === 'res' && frame.id?.startsWith('ping-')) {
+      const rawPingError = frame.error?.message || JSON.stringify(frame.error || '')
+      if (!frame.ok && /unknown method:\s*ping/i.test(rawPingError)) {
+        gatewaySupportsPingRef.current = false
+        missedPongsRef.current = 0
+        pingSentTimestamps.current.clear()
+        log.info('Gateway ping RPC unavailable; using passive heartbeat mode')
+      }
       handlePong(frame.id)
       return
     }
@@ -367,7 +415,32 @@ export function useWebSocket() {
       log.error(`Gateway error: ${frame.error?.message || JSON.stringify(frame.error)}`)
       const rawMessage = frame.error?.message || JSON.stringify(frame.error)
       const help = getGatewayErrorHelp(rawMessage)
-      const nonRetryable = isNonRetryableGatewayError(rawMessage)
+      const shouldFallbackToTokenOnly = shouldRetryWithoutDeviceIdentity(
+        rawMessage,
+        frame.error,
+        Boolean(authTokenRef.current),
+        tokenOnlyFallbackTriedRef.current,
+      )
+
+      if (shouldFallbackToTokenOnly) {
+        tokenOnlyFallbackRef.current = true
+        tokenOnlyFallbackTriedRef.current = true
+        clearDeviceIdentity()
+        addLog({
+          id: `gateway-token-only-fallback-${Date.now()}`,
+          timestamp: Date.now(),
+          level: 'warn',
+          source: 'gateway',
+          message: 'Gateway rejected cached browser device credentials. Retrying with token-only authentication.',
+        })
+        stopHeartbeat()
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close(4002, 'Retrying with token-only authentication')
+        }
+        return
+      }
+
+      const nonRetryable = isNonRetryableGatewayError(rawMessage, frame.error)
 
       addLog({
         id: nonRetryable ? `gateway-handshake-${rawMessage}` : `error-${Date.now()}`,
@@ -399,6 +472,14 @@ export function useWebSocket() {
 
     // Handle broadcast events (tick, log, chat, notification, agent status, etc.)
     if (frame.type === 'event') {
+      // Track event sequence numbers to detect gaps (missed events)
+      const seq = typeof frame.seq === 'number' ? frame.seq : null
+      if (seq !== null) {
+        if (lastSeqRef.current !== null && seq > lastSeqRef.current + 1) {
+          log.warn(`Event sequence gap: expected ${lastSeqRef.current + 1}, received ${seq}`)
+        }
+        lastSeqRef.current = seq
+      }
       if (frame.event === 'tick') {
         // Tick event contains snapshot data
         const snapshot = frame.payload?.snapshot
@@ -472,6 +553,83 @@ export function useWebSocket() {
             last_activity: data.last_activity,
           })
         }
+      } else if (frame.event === 'tool.stream') {
+        // Tool call stream — render as inline tool_call message in chat
+        const t = frame.payload
+        if (t) {
+          addChatMessage({
+            id: t.id || -(Date.now() + Math.random()),
+            conversation_id: t.conversation_id || t.sessionId || 'tool-stream',
+            from_agent: t.agentName || t.agent || 'agent',
+            to_agent: null,
+            content: '',
+            message_type: 'tool_call',
+            metadata: {
+              toolName: t.toolName || t.name,
+              toolArgs: t.args || t.toolArgs,
+              toolOutput: t.output || t.toolOutput,
+              toolStatus: t.status || 'success',
+              durationMs: t.durationMs,
+            },
+            created_at: t.timestamp ? Math.floor(t.timestamp / 1000) : Math.floor(Date.now() / 1000),
+          })
+        }
+      } else if (frame.event === 'context.compaction') {
+        // Context compaction progress toast
+        addNotification({
+          id: Date.now(),
+          recipient: 'operator',
+          type: 'info',
+          title: 'Context Compaction',
+          message: frame.payload?.message || `Session context compacted (${frame.payload?.percentage || '?'}% reduced)`,
+          created_at: Math.floor(Date.now() / 1000),
+        })
+      } else if (frame.event === 'model.fallback') {
+        // Model fallback toast
+        addNotification({
+          id: Date.now(),
+          recipient: 'operator',
+          type: 'warning',
+          title: 'Model Fallback',
+          message: frame.payload?.message || `Fell back from ${frame.payload?.from || '?'} to ${frame.payload?.to || '?'}`,
+          created_at: Math.floor(Date.now() / 1000),
+        })
+      } else if (frame.event === 'exec.approval' || frame.event === 'exec.approval.requested') {
+        // Exec approval request from gateway (supports both event name variants)
+        const a = frame.payload
+        const request = a?.request || a // reference UI nests under .request
+        if (a?.id) {
+          addExecApproval({
+            id: a.id,
+            sessionId: request?.sessionKey || a.sessionId || '',
+            agentName: request?.agentId || a.agentName,
+            toolName: a.toolName || a.name || request?.command || 'unknown',
+            toolArgs: a.args || a.toolArgs || {},
+            command: request?.command || a.command,
+            cwd: request?.cwd || a.cwd,
+            host: request?.host || a.host,
+            resolvedPath: request?.resolvedPath || a.resolvedPath,
+            risk: a.risk || 'medium',
+            createdAt: a.createdAtMs || a.createdAt || Date.now(),
+            expiresAt: a.expiresAtMs || a.expiresAt,
+            status: 'pending',
+          })
+          addNotification({
+            id: Date.now(),
+            recipient: 'operator',
+            type: 'warning',
+            title: 'Exec Approval Required',
+            message: `${request?.agentId || a.agentName || 'Agent'} wants to run: ${request?.command || a.toolName || a.name || 'tool'}`,
+            created_at: Math.floor(Date.now() / 1000),
+          })
+        }
+      } else if (frame.event === 'exec.approval.resolved') {
+        // Approval was resolved (by another client or auto-expired)
+        const resolved = frame.payload
+        if (resolved?.id) {
+          const newStatus = resolved.decision === 'deny' ? 'denied' : 'approved'
+          updateExecApproval(resolved.id, { status: newStatus as any })
+        }
       }
     }
   }, [
@@ -487,7 +645,32 @@ export function useWebSocket() {
     stopHeartbeat,
     isNonRetryableGatewayError,
     getGatewayErrorHelp,
+    addExecApproval,
+    updateExecApproval,
   ])
+
+  const normalizeWebSocketUrl = useCallback((rawUrl: string): string => {
+    const built = buildGatewayWebSocketUrl({
+      host: rawUrl,
+      port: Number(process.env.NEXT_PUBLIC_GATEWAY_PORT || '18789'),
+      browserProtocol: window.location.protocol,
+    })
+
+    const parsed = new URL(built, window.location.origin)
+    parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : parsed.protocol === 'http:' ? 'ws:' : parsed.protocol
+    parsed.hash = ''
+    return parsed.toString().replace(/\/$/, '').replace('/?', '?')
+  }, [])
+
+  const shouldSuppressWebSocketError = useCallback((message: string): boolean => {
+    const now = Date.now()
+    const previous = lastWebSocketErrorRef.current
+    if (previous && previous.message === message && now - previous.at < ERROR_LOG_DEDUPE_MS) {
+      return true
+    }
+    lastWebSocketErrorRef.current = { message, at: now }
+    return false
+  }, [])
 
   const connect = useCallback((url: string, token?: string) => {
     const state = wsRef.current?.readyState
@@ -495,28 +678,31 @@ export function useWebSocket() {
       return // Already connected or connecting
     }
 
-    // Extract token from URL if present
-    const urlObj = new URL(url, window.location.origin)
-    const urlToken = urlObj.searchParams.get('token')
+    let urlToken = ''
+    try {
+      const parsedInput = new URL(url, window.location.origin)
+      urlToken = parsedInput.searchParams.get('token') || ''
+    } catch {
+      urlToken = ''
+    }
     authTokenRef.current = token || urlToken || ''
 
-    // Remove token from URL (we'll send it in handshake)
-    urlObj.searchParams.delete('token')
-
-    reconnectUrl.current = url
+    const normalizedUrl = normalizeWebSocketUrl(url)
+    reconnectUrl.current = normalizedUrl
     handshakeCompleteRef.current = false
     manualDisconnectRef.current = false
     nonRetryableErrorRef.current = null
+    lastSeqRef.current = null
 
     try {
-      const ws = new WebSocket(url.split('?')[0]) // Connect without query params
+      const ws = new WebSocket(normalizedUrl)
       wsRef.current = ws
 
       ws.onopen = () => {
-        log.info(`Connected to ${url.split('?')[0]}`)
+        log.info(`Connected to ${normalizedUrl}`)
         // Don't set isConnected yet - wait for handshake
         setConnection({
-          url: url.split('?')[0],
+          url: normalizedUrl,
           reconnectAttempts: 0
         })
         // Wait for connect.challenge from server
@@ -556,7 +742,7 @@ export function useWebSocket() {
         // Auto-reconnect with exponential backoff (uses connectRef to avoid stale closure)
         const attempts = reconnectAttemptsRef.current
         if (attempts < maxReconnectAttempts) {
-          const base = Math.min(Math.pow(2, attempts) * 1000, 30000)
+          const base = Math.min(1000 * Math.pow(1.7, attempts), 15000)
           const timeout = Math.round(base + Math.random() * base * 0.5)
           log.info(`Reconnecting in ${timeout}ms (attempt ${attempts + 1}/${maxReconnectAttempts})`)
 
@@ -578,21 +764,35 @@ export function useWebSocket() {
       }
 
       ws.onerror = (error) => {
+        if (nonRetryableErrorRef.current) return
         log.error('WebSocket error:', error)
+        const errorMessage = 'WebSocket error occurred'
+        if (!shouldSuppressWebSocketError(errorMessage)) {
+          addLog({
+            id: `error-${Date.now()}`,
+            timestamp: Date.now(),
+            level: 'error',
+            source: 'websocket',
+            message: errorMessage
+          })
+        }
+      }
+
+    } catch (error) {
+      log.error('Failed to connect to WebSocket:', error)
+      const errorMessage = 'Failed to initialize WebSocket connection'
+      if (!shouldSuppressWebSocketError(errorMessage)) {
         addLog({
           id: `error-${Date.now()}`,
           timestamp: Date.now(),
           level: 'error',
           source: 'websocket',
-          message: `WebSocket error occurred`
+          message: errorMessage
         })
       }
-
-    } catch (error) {
-      log.error('Failed to connect to WebSocket:', error)
       setConnection({ isConnected: false })
     }
-  }, [setConnection, handleGatewayFrame, addLog, stopHeartbeat])
+  }, [setConnection, handleGatewayFrame, addLog, stopHeartbeat, normalizeWebSocketUrl, shouldSuppressWebSocketError])
 
   // Keep ref in sync so onclose always calls the latest version of connect
   useEffect(() => {
@@ -638,13 +838,6 @@ export function useWebSocket() {
       setTimeout(() => connect(reconnectUrl.current, authTokenRef.current), 1000)
     }
   }, [connect, disconnect])
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      disconnect()
-    }
-  }, [disconnect])
 
   return {
     isConnected: connection.isConnected,

@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Button } from '@/components/ui/button'
 import { useMissionControl } from '@/store'
 
 type SuperTab = 'tenants' | 'jobs' | 'events'
@@ -63,16 +64,32 @@ interface GatewayOption {
   is_primary?: number
 }
 
+interface SchedulerTask {
+  id: string
+  name: string
+  enabled: boolean
+  lastRun: number | null
+  nextRun: number
+  running: boolean
+  lastResult?: {
+    ok: boolean
+    message: string
+    timestamp: number
+  }
+}
+
 const TENANT_PAGE_SIZE = 8
 const JOB_PAGE_SIZE = 8
 
 export function SuperAdminPanel() {
-  const { currentUser } = useMissionControl()
+  const { currentUser, dashboardMode } = useMissionControl()
+  const isLocal = dashboardMode === 'local'
 
   const [tenants, setTenants] = useState<TenantRow[]>([])
   const [jobs, setJobs] = useState<ProvisionJob[]>([])
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null)
   const [selectedJobEvents, setSelectedJobEvents] = useState<ProvisionEvent[]>([])
+  const [localJobEvents, setLocalJobEvents] = useState<Record<number, ProvisionEvent[]>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null)
@@ -123,25 +140,96 @@ export function SuperAdminPanel() {
 
   const load = useCallback(async () => {
     try {
-      const [tenantsRes, jobsRes, gatewaysRes] = await Promise.all([
+      const [tenantsRes, jobsRes, gatewaysRes, schedulerRes] = await Promise.all([
         fetch('/api/super/tenants', { cache: 'no-store' }),
         fetch('/api/super/provision-jobs?limit=250', { cache: 'no-store' }),
         fetch('/api/gateways', { cache: 'no-store' }),
+        isLocal ? fetch('/api/scheduler', { cache: 'no-store' }) : Promise.resolve(null),
       ])
 
       const tenantsJson = await tenantsRes.json().catch(() => ({}))
       const jobsJson = await jobsRes.json().catch(() => ({}))
       const gatewaysJson = await gatewaysRes.json().catch(() => ({}))
+      const schedulerJson = schedulerRes ? await schedulerRes.json().catch(() => ({})) : {}
 
       if (!tenantsRes.ok) throw new Error(tenantsJson?.error || 'Failed to load tenants')
       if (!jobsRes.ok) throw new Error(jobsJson?.error || 'Failed to load provision jobs')
 
-      const tenantRows = Array.isArray(tenantsJson?.tenants) ? tenantsJson.tenants : []
-      const jobRows = Array.isArray(jobsJson?.jobs) ? jobsJson.jobs : []
+      let tenantRows = Array.isArray(tenantsJson?.tenants) ? tenantsJson.tenants : []
+      let jobRows = Array.isArray(jobsJson?.jobs) ? jobsJson.jobs : []
       const gatewayRows = Array.isArray(gatewaysJson?.gateways) ? gatewaysJson.gateways : []
+      const schedulerTasks: SchedulerTask[] = Array.isArray(schedulerJson?.tasks) ? schedulerJson.tasks : []
+      const localEvents: Record<number, ProvisionEvent[]> = {}
+
+      if (isLocal) {
+        if (tenantRows.length === 0) {
+          const primaryGateway = gatewayRows.find((gw: any) => Number(gw?.is_primary) === 1)
+          const now = Math.floor(Date.now() / 1000)
+          tenantRows = [{
+            id: -1,
+            slug: 'local-system',
+            display_name: 'Local Mission Control',
+            linux_user: currentUser?.username || 'local',
+            created_by: 'local',
+            owner_gateway: primaryGateway?.name || 'local',
+            status: 'active',
+            plan_tier: 'local',
+            gateway_port: Number(primaryGateway?.port || 0) || null,
+            dashboard_port: null,
+            created_at: now,
+            latest_job_id: null,
+            latest_job_status: null,
+          }]
+        }
+
+        if (jobRows.length === 0 && schedulerTasks.length > 0) {
+          jobRows = schedulerTasks.map((task, index) => {
+            const id = -1000 - index
+            const status = task.running
+              ? 'running'
+              : (!task.enabled ? 'cancelled' : (task.lastResult?.ok === false ? 'failed' : (task.lastRun ? 'completed' : 'queued')))
+            const eventRows: ProvisionEvent[] = []
+            if (task.lastResult) {
+              eventRows.push({
+                id: id * -10,
+                level: task.lastResult.ok ? 'info' : 'error',
+                step_key: task.id,
+                message: task.lastResult.message,
+                created_at: Math.floor(task.lastResult.timestamp / 1000),
+              })
+            }
+            eventRows.push({
+              id: id * -10 + 1,
+              level: 'info',
+              step_key: task.id,
+              message: `Next run: ${new Date(task.nextRun).toLocaleString()}`,
+              created_at: Math.floor(Date.now() / 1000),
+            })
+            localEvents[id] = eventRows
+
+            const lastRunSec = task.lastRun ? Math.floor(task.lastRun / 1000) : null
+            return {
+              id,
+              tenant_id: -1,
+              tenant_slug: 'local-system',
+              tenant_display_name: 'Local Mission Control',
+              job_type: 'automation',
+              status,
+              dry_run: 1,
+              requested_by: 'scheduler',
+              approved_by: null,
+              started_at: lastRunSec,
+              completed_at: status !== 'running' ? lastRunSec : null,
+              error_text: task.lastResult?.ok === false ? task.lastResult.message : null,
+              created_at: lastRunSec || Math.floor(task.nextRun / 1000),
+            } as ProvisionJob
+          })
+        }
+      }
 
       setTenants(tenantRows)
       setJobs(jobRows)
+      setLocalJobEvents(localEvents)
       setGatewayOptions(gatewayRows.map((g: any) => ({ id: Number(g.id), name: String(g.name), status: g.status, is_primary: g.is_primary })))
       setGatewayLoadError(gatewaysRes.ok ? null : (gatewaysJson?.error || 'Failed to load gateways'))
       setError(null)
@@ -150,9 +238,16 @@ export function SuperAdminPanel() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [currentUser?.username, isLocal])
 
   const loadJobDetail = useCallback(async (jobId: number) => {
+    if (isLocal && jobId < 0) {
+      setSelectedJobId(jobId)
+      setSelectedJobEvents(localJobEvents[jobId] || [])
+      setActiveTab('events')
+      return
+    }
+
     try {
       const res = await fetch(`/api/super/provision-jobs/${jobId}`, { cache: 'no-store' })
       const json = await res.json().catch(() => ({}))
@@ -163,7 +258,7 @@ export function SuperAdminPanel() {
     } catch (e: any) {
       showFeedback(false, e?.message || 'Failed to load job details')
     }
-  }, [])
+  }, [isLocal, localJobEvents])
 
   useEffect(() => {
     load()
@@ -301,6 +396,34 @@ export function SuperAdminPanel() {
     }
   }
 
+  const approveAndRunJob = async (jobId: number) => {
+    setBusyJobId(jobId)
+    try {
+      const approveRes = await fetch(`/api/super/provision-jobs/${jobId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'approve' }),
+      })
+      const approveJson = await approveRes.json().catch(() => ({}))
+      if (!approveRes.ok) throw new Error(approveJson?.error || `Failed to approve job #${jobId}`)
+
+      const runRes = await fetch(`/api/super/provision-jobs/${jobId}/run`, { method: 'POST' })
+      const runJson = await runRes.json().catch(() => ({}))
+      if (!runRes.ok) throw new Error(runJson?.error || `Failed to run job #${jobId}`)
+
+      showFeedback(true, `Job #${jobId} approved and executed`)
+      await load()
+      await loadJobDetail(jobId)
+    } catch (e: any) {
+      showFeedback(false, e?.message || `Failed to approve/run job #${jobId}`)
+      await load()
+      await loadJobDetail(jobId)
+    } finally {
+      setBusyJobId(null)
+      setOpenActionMenu(null)
+    }
+  }
+
   const openDecommissionDialog = (tenant: TenantRow) => {
     setOpenActionMenu(null)
     setDecommissionDialog({
@@ -406,20 +529,31 @@ export function SuperAdminPanel() {
         <div>
           <h2 className="text-lg font-semibold text-foreground">Super Mission Control</h2>
           <p className="text-sm text-muted-foreground">
-            Multi-tenant provisioning control plane with approval gates and safer destructive actions.
+            {isLocal
+              ? 'Local control plane view over scheduler automations and runtime state.'
+              : 'Multi-tenant provisioning control plane with approval gates and safer destructive actions.'}
           </p>
         </div>
-        <button
-          onClick={load}
-          className="h-8 px-3 rounded-md border border-border text-sm text-foreground hover:bg-secondary/60 transition-smooth"
-        >
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            onClick={() => setCreateExpanded(true)}
+          >
+            + Add Workspace
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={load}
+          >
+            Refresh
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         <div className="rounded-lg border border-border bg-card px-4 py-3">
-          <div className="text-xs text-muted-foreground">Active Tenants</div>
+          <div className="text-xs text-muted-foreground">Active Orgs</div>
           <div className="text-xl font-semibold text-foreground mt-1">{kpis.active}</div>
         </div>
         <div className="rounded-lg border border-border bg-card px-4 py-3">
@@ -427,7 +561,7 @@ export function SuperAdminPanel() {
           <div className="text-xl font-semibold text-foreground mt-1">{kpis.pending}</div>
         </div>
         <div className="rounded-lg border border-border bg-card px-4 py-3">
-          <div className="text-xs text-muted-foreground">Errored Tenants</div>
+          <div className="text-xs text-muted-foreground">Errored Orgs</div>
           <div className="text-xl font-semibold text-red-400 mt-1">{kpis.errored}</div>
         </div>
         <div className="rounded-lg border border-border bg-card px-4 py-3">
@@ -452,17 +586,23 @@ export function SuperAdminPanel() {
         </div>
       )}
 
-      <div className="rounded-lg border border-border bg-card overflow-hidden">
-        <button
-          onClick={() => setCreateExpanded((v) => !v)}
-          className="w-full px-4 py-3 border-b border-border text-left text-sm font-medium text-foreground hover:bg-secondary/20"
-        >
-          {createExpanded ? 'Hide' : 'Show'} Create Client Instance
-        </button>
-        {createExpanded && (
+      {createExpanded && (
+      <div className="rounded-lg border border-primary/30 bg-card overflow-hidden">
+        <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+          <h3 className="text-sm font-medium text-foreground">Create New Workspace</h3>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={() => setCreateExpanded(false)}
+            aria-label="Close create form"
+            className="text-lg w-6 h-6"
+          >
+            ×
+          </Button>
+        </div>
           <div className="p-4 space-y-3">
             <div className="text-xs text-muted-foreground">
-              Add a new workspace/client instance here. Fill the form below and click <span className="text-foreground font-medium">Create + Queue</span>.
+              Fill in the workspace details below and click <span className="text-foreground font-medium">Create + Queue</span> to provision a new client instance.
             </div>
             {gatewayLoadError && (
               <div className="px-3 py-2 rounded-md text-xs border bg-amber-500/10 text-amber-300 border-amber-500/20">
@@ -532,31 +672,32 @@ export function SuperAdminPanel() {
                 />
                 Dry-run
               </label>
-              <button
+              <Button
                 onClick={createTenant}
-                className="h-9 px-4 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-smooth"
               >
                 Create + Queue
-              </button>
+              </Button>
             </div>
           </div>
-        )}
       </div>
+      )}
 
       <div className="rounded-lg border border-border bg-card overflow-hidden">
         <div className="px-3 py-2 border-b border-border flex items-center gap-2">
           {(['tenants', 'jobs', 'events'] as SuperTab[]).map((tab) => (
-            <button
+            <Button
               key={tab}
+              variant={activeTab === tab ? 'secondary' : 'ghost'}
+              size="sm"
               onClick={() => setActiveTab(tab)}
-              className={`h-8 px-3 rounded-md text-sm capitalize ${
+              className={`capitalize ${
                 activeTab === tab
                   ? 'bg-primary/20 text-primary border border-primary/30'
-                  : 'text-muted-foreground border border-transparent hover:bg-secondary/40'
+                  : 'border border-transparent'
               }`}
             >
-              {tab}
-            </button>
+              {tab === 'tenants' ? 'Organizations' : tab}
+            </Button>
           ))}
         </div>
 
@@ -567,7 +708,7 @@ export function SuperAdminPanel() {
                 <input
                   value={tenantSearch}
                   onChange={(e) => setTenantSearch(e.target.value)}
-                  placeholder="Search tenants"
+                  placeholder="Search organizations"
                   className="h-8 w-56 px-3 rounded-md bg-secondary border border-border text-xs text-foreground"
                 />
                 <select
@@ -625,29 +766,38 @@ export function SuperAdminPanel() {
                         </td>
                         <td className="px-3 py-2 text-xs">
                           {latest ? (
-                            <button onClick={() => loadJobDetail(latest.id)} className="text-primary hover:underline">
+                            <Button variant="link" size="xs" onClick={() => loadJobDetail(latest.id)} className="p-0 h-auto">
                               #{latest.id} · {latest.status}
-                            </button>
+                            </Button>
                           ) : (
                             <span className="text-muted-foreground">-</span>
                           )}
                         </td>
                         <td className="px-3 py-2 text-right relative">
-                          <button
-                            onClick={() => setOpenActionMenu((cur) => (cur === menuKey ? null : menuKey))}
-                            className="h-7 px-2 rounded border border-border text-xs hover:bg-secondary/60"
-                          >
-                            Actions
-                          </button>
-                          {openActionMenu === menuKey && (
-                            <div className="absolute right-3 top-10 z-20 w-44 rounded-md border border-border bg-card shadow-xl text-left">
-                              <button
-                                onClick={() => openDecommissionDialog(tenant)}
-                                className="w-full px-3 py-2 text-xs text-red-300 hover:bg-red-500/10"
+                          {isLocal && tenant.id < 0 ? (
+                            <span className="text-[11px] text-muted-foreground">Local read-only</span>
+                          ) : (
+                            <>
+                              <Button
+                                variant="outline"
+                                size="xs"
+                                onClick={() => setOpenActionMenu((cur) => (cur === menuKey ? null : menuKey))}
                               >
-                                Queue Decommission
-                              </button>
-                            </div>
+                                Actions
+                              </Button>
+                              {openActionMenu === menuKey && (
+                                <div className="absolute right-3 top-10 z-20 w-44 rounded-md border border-border bg-card shadow-xl text-left">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => openDecommissionDialog(tenant)}
+                                    className="w-full justify-start text-xs text-red-300 hover:bg-red-500/10 rounded-none"
+                                  >
+                                    Queue Decommission
+                                  </Button>
+                                </div>
+                              )}
+                            </>
                           )}
                         </td>
                       </tr>
@@ -655,7 +805,7 @@ export function SuperAdminPanel() {
                   })}
                   {pagedTenants.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="px-3 py-6 text-center text-xs text-muted-foreground">No matching tenants.</td>
+                      <td colSpan={6} className="px-3 py-6 text-center text-xs text-muted-foreground">No matching organizations.</td>
                     </tr>
                   )}
                 </tbody>
@@ -663,21 +813,23 @@ export function SuperAdminPanel() {
             </div>
 
             <div className="flex items-center justify-end gap-2 text-xs">
-              <button
+              <Button
+                variant="outline"
+                size="xs"
                 disabled={tenantPage <= 1}
                 onClick={() => setTenantPage((p) => Math.max(1, p - 1))}
-                className="h-7 px-2 rounded border border-border disabled:opacity-50"
               >
                 Prev
-              </button>
+              </Button>
               <span className="text-muted-foreground">Page {tenantPage} / {tenantPages}</span>
-              <button
+              <Button
+                variant="outline"
+                size="xs"
                 disabled={tenantPage >= tenantPages}
                 onClick={() => setTenantPage((p) => Math.min(tenantPages, p + 1))}
-                className="h-7 px-2 rounded border border-border disabled:opacity-50"
               >
                 Next
-              </button>
+              </Button>
             </div>
           </div>
         )}
@@ -734,9 +886,9 @@ export function SuperAdminPanel() {
                     return (
                       <tr key={job.id} className={`border-b border-border/50 last:border-0 ${selectedJobId === job.id ? 'bg-primary/10' : 'hover:bg-secondary/20'}`}>
                         <td className="px-3 py-2">
-                          <button onClick={() => loadJobDetail(job.id)} className="text-primary hover:underline text-xs">
+                          <Button variant="link" size="xs" onClick={() => loadJobDetail(job.id)} className="p-0 h-auto">
                             #{job.id}
-                          </button>
+                          </Button>
                           <div className="text-[11px] text-muted-foreground">{job.job_type} {job.dry_run ? '(dry)' : '(live)'}</div>
                         </td>
                         <td className="px-3 py-2 text-muted-foreground text-xs">{job.tenant_slug || job.tenant_id}</td>
@@ -746,42 +898,63 @@ export function SuperAdminPanel() {
                           <div>Appr: {job.approved_by || '-'}</div>
                         </td>
                         <td className="px-3 py-2 text-right relative">
-                          <button
-                            onClick={() => setOpenActionMenu((cur) => (cur === menuKey ? null : menuKey))}
-                            className="h-7 px-2 rounded border border-border text-xs hover:bg-secondary/60"
-                          >
-                            Actions
-                          </button>
-                          {openActionMenu === menuKey && (
-                            <div className="absolute right-3 top-10 z-20 w-40 rounded-md border border-border bg-card shadow-xl text-left">
-                              <button
-                                onClick={() => loadJobDetail(job.id)}
-                                className="w-full px-3 py-2 text-xs text-foreground hover:bg-secondary/40"
+                          {isLocal && job.id < 0 ? (
+                            <Button
+                              variant="outline"
+                              size="xs"
+                              onClick={() => loadJobDetail(job.id)}
+                            >
+                              View
+                            </Button>
+                          ) : (
+                            <>
+                              <Button
+                                variant="outline"
+                                size="xs"
+                                onClick={() => setOpenActionMenu((cur) => (cur === menuKey ? null : menuKey))}
                               >
-                                View events
-                              </button>
-                              <button
-                                onClick={() => setJobState(job.id, 'approve')}
-                                disabled={busyJobId === job.id || !['queued', 'rejected', 'failed'].includes(job.status)}
-                                className="w-full px-3 py-2 text-xs text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40"
-                              >
-                                Approve
-                              </button>
-                              <button
-                                onClick={() => setJobState(job.id, 'reject')}
-                                disabled={busyJobId === job.id || !['queued', 'approved', 'failed'].includes(job.status)}
-                                className="w-full px-3 py-2 text-xs text-amber-400 hover:bg-amber-500/10 disabled:opacity-40"
-                              >
-                                Reject
-                              </button>
-                              <button
-                                onClick={() => runJob(job.id)}
-                                disabled={busyJobId === job.id || job.status !== 'approved'}
-                                className="w-full px-3 py-2 text-xs text-primary hover:bg-primary/10 disabled:opacity-40"
-                              >
-                                {busyJobId === job.id ? 'Running...' : 'Run'}
-                              </button>
-                            </div>
+                                Actions
+                              </Button>
+                              {openActionMenu === menuKey && (
+                                <div className="absolute right-3 top-10 z-20 w-40 rounded-md border border-border bg-card shadow-xl text-left">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => loadJobDetail(job.id)}
+                                    className="w-full justify-start text-xs rounded-none"
+                                  >
+                                    View events
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => Number(job.dry_run) === 1 ? approveAndRunJob(job.id) : setJobState(job.id, 'approve')}
+                                    disabled={busyJobId === job.id || !['queued', 'rejected', 'failed'].includes(job.status)}
+                                    className="w-full justify-start text-xs text-emerald-400 hover:bg-emerald-500/10 rounded-none"
+                                  >
+                                    {Number(job.dry_run) === 1 ? 'Approve + Run' : 'Approve'}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => setJobState(job.id, 'reject')}
+                                    disabled={busyJobId === job.id || !['queued', 'approved', 'failed'].includes(job.status)}
+                                    className="w-full justify-start text-xs text-amber-400 hover:bg-amber-500/10 rounded-none"
+                                  >
+                                    Reject
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => runJob(job.id)}
+                                    disabled={busyJobId === job.id || job.status !== 'approved'}
+                                    className="w-full justify-start text-xs text-primary hover:bg-primary/10 rounded-none"
+                                  >
+                                    {busyJobId === job.id ? 'Running...' : 'Run'}
+                                  </Button>
+                                </div>
+                              )}
+                            </>
                           )}
                         </td>
                       </tr>
@@ -797,21 +970,23 @@ export function SuperAdminPanel() {
             </div>
 
             <div className="flex items-center justify-end gap-2 text-xs">
-              <button
+              <Button
+                variant="outline"
+                size="xs"
                 disabled={jobPage <= 1}
                 onClick={() => setJobPage((p) => Math.max(1, p - 1))}
-                className="h-7 px-2 rounded border border-border disabled:opacity-50"
               >
                 Prev
-              </button>
+              </Button>
               <span className="text-muted-foreground">Page {jobPage} / {jobPages}</span>
-              <button
+              <Button
+                variant="outline"
+                size="xs"
                 disabled={jobPage >= jobPages}
                 onClick={() => setJobPage((p) => Math.min(jobPages, p + 1))}
-                className="h-7 px-2 rounded border border-border disabled:opacity-50"
               >
                 Next
-              </button>
+              </Button>
             </div>
           </div>
         )}
@@ -935,22 +1110,25 @@ export function SuperAdminPanel() {
             </div>
 
             <div className="px-4 py-3 border-t border-border flex items-center justify-end gap-2">
-              <button
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={closeDecommissionDialog}
                 disabled={decommissionDialog.submitting}
-                className="h-8 px-3 rounded-md border border-border text-sm text-foreground hover:bg-secondary/60 disabled:opacity-50"
               >
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
                 onClick={queueDecommissionFromDialog}
                 disabled={!canSubmitDecommission || decommissionDialog.submitting}
-                className="h-8 px-3 rounded-md border border-red-500/40 bg-red-500/20 text-red-300 text-sm disabled:opacity-50 hover:bg-red-500/30"
+                className="bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/30"
               >
                 {decommissionDialog.submitting
                   ? 'Queueing...'
                   : (decommissionDialog.dryRun ? 'Queue Dry-run Decommission' : 'Queue Live Decommission')}
-              </button>
+              </Button>
             </div>
           </div>
         </div>

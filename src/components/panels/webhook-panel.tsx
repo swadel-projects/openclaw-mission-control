@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { Button } from '@/components/ui/button'
 import { useSmartPoll } from '@/lib/use-smart-poll'
+import { useMissionControl } from '@/store'
 
 interface Webhook {
   id: number
@@ -33,6 +35,16 @@ interface Delivery {
   created_at: number
 }
 
+interface SchedulerTask {
+  id: string
+  name: string
+  enabled: boolean
+  lastRun: number | null
+  nextRun: number | null
+  running: boolean
+  lastResult?: { ok: boolean; message: string; timestamp: number }
+}
+
 const AVAILABLE_EVENTS = [
   { value: '*', label: 'All events', description: 'Receive all event types' },
   { value: 'agent.error', label: 'Agent error', description: 'Agent enters error state' },
@@ -48,7 +60,10 @@ const AVAILABLE_EVENTS = [
 ]
 
 export function WebhookPanel() {
+  const { dashboardMode } = useMissionControl()
+  const isLocalMode = dashboardMode === 'local'
   const [webhooks, setWebhooks] = useState<Webhook[]>([])
+  const [webhookAutomations, setWebhookAutomations] = useState<SchedulerTask[]>([])
   const [deliveries, setDeliveries] = useState<Delivery[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -57,6 +72,7 @@ export function WebhookPanel() {
   const [testingId, setTestingId] = useState<number | null>(null)
   const [testResult, setTestResult] = useState<any>(null)
   const [newSecret, setNewSecret] = useState<string | null>(null)
+  const [runningAutomationId, setRunningAutomationId] = useState<string | null>(null)
 
   const fetchWebhooks = useCallback(async () => {
     try {
@@ -88,9 +104,30 @@ export function WebhookPanel() {
     } catch { /* silent */ }
   }, [selectedWebhook])
 
+  const fetchWebhookAutomations = useCallback(async () => {
+    if (!isLocalMode) {
+      setWebhookAutomations([])
+      return
+    }
+    try {
+      const res = await fetch('/api/scheduler')
+      if (!res.ok) return
+      const data = await res.json()
+      const tasks = Array.isArray(data.tasks) ? data.tasks : []
+      const webhookTasks = tasks.filter((task: SchedulerTask) =>
+        typeof task.id === 'string' && task.id.includes('webhook')
+      )
+      setWebhookAutomations(webhookTasks)
+    } catch {
+      // Keep UI usable if scheduler endpoint is unavailable.
+    }
+  }, [isLocalMode])
+
   useEffect(() => { fetchWebhooks() }, [fetchWebhooks])
   useEffect(() => { fetchDeliveries() }, [fetchDeliveries])
+  useEffect(() => { fetchWebhookAutomations() }, [fetchWebhookAutomations])
   useSmartPoll(fetchWebhooks, 60000, { pauseWhenDisconnected: true })
+  useSmartPoll(fetchWebhookAutomations, 60000, { pauseWhenDisconnected: true })
 
   async function handleCreate(form: { name: string; url: string; events: string[] }) {
     try {
@@ -142,6 +179,29 @@ export function WebhookPanel() {
     }
   }
 
+  async function handleRunAutomation(taskId: string) {
+    setRunningAutomationId(taskId)
+    try {
+      const res = await fetch('/api/scheduler', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_id: taskId }),
+      })
+      const data = await res.json()
+      setTestResult({
+        success: !!data.ok && res.ok,
+        error: data.error || (!data.ok ? data.message : null),
+        duration_ms: undefined,
+        status_code: res.status,
+      })
+      await fetchWebhookAutomations()
+    } catch {
+      setTestResult({ success: false, error: 'Failed to run local automation' })
+    } finally {
+      setRunningAutomationId(null)
+    }
+  }
+
   function formatTime(ts: number) {
     return new Date(ts * 1000).toLocaleString(undefined, {
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -158,12 +218,12 @@ export function WebhookPanel() {
             {webhooks.length} webhook{webhooks.length !== 1 ? 's' : ''} configured
           </p>
         </div>
-        <button
+        <Button
           onClick={() => setShowCreate(true)}
-          className="h-8 px-3 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-smooth"
+          size="sm"
         >
           + Add Webhook
-        </button>
+        </Button>
       </div>
 
       {error && (
@@ -179,12 +239,13 @@ export function WebhookPanel() {
           <code className="block text-xs font-mono bg-secondary rounded px-2 py-1.5 text-foreground break-all select-all">
             {newSecret}
           </code>
-          <button
+          <Button
+            variant="link"
+            size="xs"
             onClick={() => setNewSecret(null)}
-            className="text-xs text-muted-foreground hover:text-foreground transition-smooth"
           >
             Dismiss
-          </button>
+          </Button>
         </div>
       )}
 
@@ -201,9 +262,9 @@ export function WebhookPanel() {
                 <span className="text-red-400">Test failed</span>
               )}
             </p>
-            <button onClick={() => setTestResult(null)} className="text-xs text-muted-foreground">
+            <Button variant="link" size="xs" onClick={() => setTestResult(null)}>
               Dismiss
-            </button>
+            </Button>
           </div>
           <div className="text-xs text-muted-foreground space-y-0.5">
             {testResult.status_code && <p>Status: <span className="font-mono">{testResult.status_code}</span></p>}
@@ -223,6 +284,43 @@ export function WebhookPanel() {
 
       {/* Webhook list */}
       <div className="space-y-2">
+        {isLocalMode && webhookAutomations.length > 0 && (
+          <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-3">
+            <h3 className="text-sm font-semibold text-cyan-200">Local Webhook Automations</h3>
+            <p className="text-2xs text-cyan-300/80 mt-0.5 mb-2">
+              Local scheduler tasks that support webhook delivery and retries
+            </p>
+            <div className="space-y-2">
+              {webhookAutomations.map((task) => (
+                <div key={task.id} className="rounded border border-cyan-500/20 bg-background/30 p-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-2 h-2 rounded-full ${task.running ? 'bg-blue-400' : task.enabled ? 'bg-green-500' : 'bg-muted-foreground/40'}`} />
+                        <span className="text-xs font-medium text-foreground truncate">{task.name}</span>
+                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-cyan-500/15 text-cyan-300 font-mono">{task.id}</span>
+                      </div>
+                      <div className="text-2xs text-muted-foreground mt-1">
+                        {task.nextRun ? `Next run ${formatTime(task.nextRun / 1000)}` : 'No next run scheduled'}
+                        {task.lastResult?.message ? ` · ${task.lastResult.message}` : ''}
+                      </div>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      onClick={() => handleRunAutomation(task.id)}
+                      disabled={runningAutomationId === task.id}
+                      className="text-cyan-300 hover:text-cyan-200 hover:bg-cyan-500/10 text-2xs"
+                    >
+                      {runningAutomationId === task.id ? 'Running...' : 'Run'}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {loading && webhooks.length === 0 ? (
           <div className="space-y-2">
             {[...Array(3)].map((_, i) => <div key={i} className="h-16 rounded-lg shimmer" />)}
@@ -274,30 +372,36 @@ export function WebhookPanel() {
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">
-                  <button
+                  <Button
+                    variant="ghost"
+                    size="xs"
                     onClick={() => handleTest(wh.id)}
                     disabled={testingId === wh.id}
-                    className="h-7 px-2 text-2xs font-medium text-muted-foreground hover:text-foreground hover:bg-secondary rounded transition-smooth disabled:opacity-50"
                     title="Send test event"
+                    className="text-2xs"
                   >
                     {testingId === wh.id ? 'Testing...' : 'Test'}
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="xs"
                     onClick={() => handleToggle(wh.id, !wh.enabled)}
-                    className={`h-7 px-2 text-2xs font-medium rounded transition-smooth ${
+                    className={`text-2xs ${
                       wh.enabled
                         ? 'text-amber-400 hover:bg-amber-500/10'
                         : 'text-green-400 hover:bg-green-500/10'
                     }`}
                   >
                     {wh.enabled ? 'Disable' : 'Enable'}
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="xs"
                     onClick={() => handleDelete(wh.id)}
-                    className="h-7 px-2 text-2xs font-medium text-red-400 hover:bg-red-500/10 rounded transition-smooth"
+                    className="text-red-400 hover:bg-red-500/10 text-2xs"
                   >
                     Delete
-                  </button>
+                  </Button>
                 </div>
               </div>
 
@@ -400,37 +504,38 @@ function CreateWebhookForm({
         <label className="block text-xs text-muted-foreground mb-1.5">Events</label>
         <div className="flex flex-wrap gap-1.5">
           {AVAILABLE_EVENTS.map((ev) => (
-            <button
+            <Button
               key={ev.value}
               type="button"
+              variant={selectedEvents.includes(ev.value) ? 'default' : 'secondary'}
+              size="xs"
               onClick={() => toggleEvent(ev.value)}
               title={ev.description}
-              className={`h-6 px-2 rounded text-2xs font-medium transition-smooth ${
-                selectedEvents.includes(ev.value)
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-secondary text-muted-foreground hover:text-foreground'
-              }`}
+              className="h-6 text-2xs"
             >
               {ev.label}
-            </button>
+            </Button>
           ))}
         </div>
       </div>
 
       <div className="flex gap-2 pt-1">
-        <button
+        <Button
+          variant="outline"
+          size="sm"
           onClick={onCancel}
-          className="flex-1 h-8 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-secondary border border-border transition-smooth"
+          className="flex-1"
         >
           Cancel
-        </button>
-        <button
+        </Button>
+        <Button
+          size="sm"
           onClick={() => onSubmit({ name, url, events: selectedEvents })}
           disabled={!name || !url}
-          className="flex-1 h-8 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-smooth disabled:opacity-50"
+          className="flex-1"
         >
           Create Webhook
-        </button>
+        </Button>
       </div>
     </div>
   )

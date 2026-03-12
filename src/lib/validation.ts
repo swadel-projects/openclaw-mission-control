@@ -26,6 +26,11 @@ export async function validateBody<T>(
   }
 }
 
+const taskMetadataSchema = z.object({
+  implementation_repo: z.string().min(1, 'implementation_repo cannot be empty').max(200).optional(),
+  code_location: z.string().min(1, 'code_location cannot be empty').max(500).optional(),
+}).catchall(z.unknown())
+
 export const createTaskSchema = z.object({
   title: z.string().min(1, 'Title is required').max(500),
   description: z.string().max(5000).optional(),
@@ -34,17 +39,25 @@ export const createTaskSchema = z.object({
   project_id: z.number().int().positive().optional(),
   assigned_to: z.string().max(100).optional(),
   created_by: z.string().max(100).optional(),
-  due_date: z.number().optional(),
-  estimated_hours: z.number().min(0).optional(),
-  actual_hours: z.number().min(0).optional(),
-  tags: z.array(z.string()).default([] as string[]),
-  metadata: z.record(z.string(), z.unknown()).default({} as Record<string, unknown>),
+  due_date: z.number().int().min(0).max(4102444800).optional(), // max ~2100-01-01
+  estimated_hours: z.number().min(0).max(10000).optional(),
+  actual_hours: z.number().min(0).max(10000).optional(),
+  outcome: z.enum(['success', 'failed', 'partial', 'abandoned']).optional(),
+  error_message: z.string().max(5000).optional(),
+  resolution: z.string().max(5000).optional(),
+  feedback_rating: z.number().int().min(1).max(5).optional(),
+  feedback_notes: z.string().max(5000).optional(),
+  retry_count: z.number().int().min(0).optional(),
+  completed_at: z.number().int().min(0).max(4102444800).optional(),
+  tags: z.array(z.string().min(1).max(100)).max(50).default([] as string[]),
+  metadata: taskMetadataSchema.default({} as Record<string, unknown>),
 })
 
 export const updateTaskSchema = createTaskSchema.partial()
 
 export const createAgentSchema = z.object({
   name: z.string().min(1, 'Name is required').max(100),
+  openclaw_id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'openclaw_id must be kebab-case').max(100).optional(),
   role: z.string().min(1, 'Role is required').max(100).optional(),
   session_key: z.string().max(200).optional(),
   soul_content: z.string().max(50000).optional(),
@@ -53,6 +66,8 @@ export const createAgentSchema = z.object({
   template: z.string().max(100).optional(),
   gateway_config: z.record(z.string(), z.unknown()).optional(),
   write_to_gateway: z.boolean().optional(),
+  provision_openclaw_workspace: z.boolean().optional(),
+  openclaw_workspace_path: z.string().min(1).max(500).optional(),
 })
 
 export const bulkUpdateTaskStatusSchema = z.object({
@@ -65,7 +80,7 @@ export const bulkUpdateTaskStatusSchema = z.object({
 export const createWebhookSchema = z.object({
   name: z.string().min(1, 'Name is required').max(200),
   url: z.string().url('Invalid URL'),
-  events: z.array(z.string()).optional(),
+  events: z.array(z.string().min(1).max(200)).max(50).optional(),
   generate_secret: z.boolean().optional(),
 })
 
@@ -93,22 +108,22 @@ export const integrationActionSchema = z.object({
 })
 
 export const createPipelineSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  description: z.string().optional(),
+  name: z.string().min(1, 'Name is required').max(200),
+  description: z.string().max(5000).optional(),
   steps: z.array(z.object({
-    template_id: z.number(),
+    template_id: z.number().int().positive(),
     on_failure: z.enum(['stop', 'continue']).default('stop'),
-  })).min(2, 'Pipeline needs at least 2 steps'),
+  })).min(2, 'Pipeline needs at least 2 steps').max(50),
 })
 
 export const createWorkflowSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  task_prompt: z.string().min(1, 'Task prompt is required'),
-  description: z.string().optional(),
-  model: z.string().default('sonnet'),
-  timeout_seconds: z.number().default(300),
-  agent_role: z.string().optional(),
-  tags: z.array(z.string()).default([]),
+  name: z.string().min(1, 'Name is required').max(200),
+  task_prompt: z.string().min(1, 'Task prompt is required').max(10000),
+  description: z.string().max(5000).optional(),
+  model: z.string().max(100).default('sonnet'),
+  timeout_seconds: z.number().int().min(10).max(3600).default(300),
+  agent_role: z.string().max(100).optional(),
+  tags: z.array(z.string().min(1).max(100)).max(50).default([]),
 })
 
 export const createCommentSchema = z.object({
@@ -130,6 +145,7 @@ export const updateSettingsSchema = z.object({
 
 export const gatewayConfigUpdateSchema = z.object({
   updates: z.record(z.string(), z.unknown()),
+  hash: z.string().optional(),
 })
 
 export const qualityReviewSchema = z.object({
@@ -171,7 +187,7 @@ export const connectSchema = z.object({
 })
 
 export const githubSyncSchema = z.object({
-  action: z.enum(['sync', 'comment', 'close', 'status']),
+  action: z.enum(['sync', 'comment', 'close', 'status', 'init-labels', 'sync-project']),
   repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Repo must be owner/repo format').optional(),
   labels: z.string().optional(),
   state: z.enum(['open', 'closed', 'all']).optional(),
@@ -179,4 +195,5 @@ export const githubSyncSchema = z.object({
   issueNumber: z.number().optional(),
   body: z.string().optional(),
   comment: z.string().optional(),
+  project_id: z.number().optional(),
 })

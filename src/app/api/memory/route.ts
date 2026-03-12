@@ -3,12 +3,15 @@ import { readdir, readFile, stat, lstat, realpath, writeFile, mkdir, unlink } fr
 import { existsSync, mkdirSync } from 'fs'
 import { join, dirname, sep } from 'path'
 import { config } from '@/lib/config'
+import { db_helpers } from '@/lib/db'
 import { resolveWithin } from '@/lib/paths'
 import { requireRole } from '@/lib/auth'
 import { readLimiter, mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { validateSchema, extractWikiLinks } from '@/lib/memory-utils'
 
 const MEMORY_PATH = config.memoryDir
+const MEMORY_ALLOWED_PREFIXES = (config.memoryAllowedPrefixes || []).map((p) => p.replace(/\\/g, '/'))
 
 // Ensure memory directory exists on startup
 if (MEMORY_PATH && !existsSync(MEMORY_PATH)) {
@@ -24,6 +27,16 @@ interface MemoryFile {
   children?: MemoryFile[]
 }
 
+function normalizeRelativePath(value: string): string {
+  return String(value || '').replace(/\\/g, '/').replace(/^\/+/, '')
+}
+
+function isPathAllowed(relativePath: string): boolean {
+  if (!MEMORY_ALLOWED_PREFIXES.length) return true
+  const normalized = normalizeRelativePath(relativePath)
+  return MEMORY_ALLOWED_PREFIXES.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix))
+}
+
 function isWithinBase(base: string, candidate: string): boolean {
   if (candidate === base) return true
   return candidate.startsWith(base + sep)
@@ -33,17 +46,22 @@ async function resolveSafeMemoryPath(baseDir: string, relativePath: string): Pro
   const baseReal = await realpath(baseDir)
   const fullPath = resolveWithin(baseDir, relativePath)
 
-  // For non-existent paths, validate containment using the parent directory realpath.
-  // This also blocks symlinked parent segments that escape the base.
-  let parentReal: string
-  try {
-    parentReal = await realpath(dirname(fullPath))
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') {
-      throw new Error('Parent directory not found')
+  // For non-existent targets, validate containment using the nearest existing ancestor.
+  // This allows nested creates (mkdir -p) while still blocking symlink escapes.
+  let current = dirname(fullPath)
+  let parentReal = ''
+  while (!parentReal) {
+    try {
+      parentReal = await realpath(current)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT') throw err
+      const next = dirname(current)
+      if (next === current) {
+        throw new Error('Parent directory not found')
+      }
+      current = next
     }
-    throw err
   }
   if (!isWithinBase(baseReal, parentReal)) {
     throw new Error('Path escapes base directory (symlink)')
@@ -69,7 +87,11 @@ async function resolveSafeMemoryPath(baseDir: string, relativePath: string): Pro
   return fullPath
 }
 
-async function buildFileTree(dirPath: string, relativePath: string = ''): Promise<MemoryFile[]> {
+async function buildFileTree(
+  dirPath: string,
+  relativePath: string = '',
+  maxDepth: number = Number.POSITIVE_INFINITY,
+): Promise<MemoryFile[]> {
   try {
     const items = await readdir(dirPath, { withFileTypes: true })
     const files: MemoryFile[] = []
@@ -85,7 +107,10 @@ async function buildFileTree(dirPath: string, relativePath: string = ''): Promis
         const stats = await stat(itemPath)
         
         if (item.isDirectory()) {
-          const children = await buildFileTree(itemPath, itemRelativePath)
+          const children =
+            maxDepth > 0
+              ? await buildFileTree(itemPath, itemRelativePath, maxDepth - 1)
+              : undefined
           files.push({
             path: itemRelativePath,
             name: item.name,
@@ -131,18 +156,57 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url)
     const path = searchParams.get('path')
     const action = searchParams.get('action')
+    const depthParam = Number.parseInt(searchParams.get('depth') || '', 10)
+    const maxDepth = Number.isFinite(depthParam) ? Math.max(0, Math.min(depthParam, 8)) : Number.POSITIVE_INFINITY
 
     if (action === 'tree') {
       // Return the file tree
       if (!MEMORY_PATH) {
         return NextResponse.json({ tree: [] })
       }
-      const tree = await buildFileTree(MEMORY_PATH)
+      if (path) {
+        if (!isPathAllowed(path)) {
+          return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
+        }
+        const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
+        const stats = await stat(fullPath).catch(() => null)
+        if (!stats?.isDirectory()) {
+          return NextResponse.json({ error: 'Directory not found' }, { status: 404 })
+        }
+        const tree = await buildFileTree(fullPath, path, maxDepth)
+        return NextResponse.json({ tree })
+      }
+      if (MEMORY_ALLOWED_PREFIXES.length) {
+        const tree: MemoryFile[] = []
+        for (const prefix of MEMORY_ALLOWED_PREFIXES) {
+          const folder = prefix.replace(/\/$/, '')
+          const fullPath = join(MEMORY_PATH, folder)
+          if (!existsSync(fullPath)) continue
+          try {
+            const stats = await stat(fullPath)
+            if (!stats.isDirectory()) continue
+            tree.push({
+              path: folder,
+              name: folder,
+              type: 'directory',
+              modified: stats.mtime.getTime(),
+              children: await buildFileTree(fullPath, folder, maxDepth),
+            })
+          } catch {
+            // Skip unreadable roots
+          }
+        }
+        return NextResponse.json({ tree })
+      }
+      const tree = await buildFileTree(MEMORY_PATH, '', maxDepth)
       return NextResponse.json({ tree })
     }
 
     if (action === 'content' && path) {
       // Return file content
+      if (!isPathAllowed(path)) {
+        return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
+      }
       if (!MEMORY_PATH) {
         return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
       }
@@ -151,12 +215,19 @@ export async function GET(request: NextRequest) {
       try {
         const content = await readFile(fullPath, 'utf-8')
         const stats = await stat(fullPath)
-        
+
+        // Extract wiki-links and schema validation for .md files
+        const isMarkdown = path.endsWith('.md')
+        const wikiLinks = isMarkdown ? extractWikiLinks(content) : []
+        const schemaResult = isMarkdown ? validateSchema(content) : null
+
         return NextResponse.json({
           content,
           size: stats.size,
           modified: stats.mtime.getTime(),
-          path
+          path,
+          wikiLinks,
+          schema: schemaResult,
         })
       } catch (error) {
         return NextResponse.json({ error: 'File not found' }, { status: 404 })
@@ -227,7 +298,16 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      await searchDirectory(MEMORY_PATH)
+      if (MEMORY_ALLOWED_PREFIXES.length) {
+        for (const prefix of MEMORY_ALLOWED_PREFIXES) {
+          const folder = prefix.replace(/\/$/, '')
+          const fullPath = join(MEMORY_PATH, folder)
+          if (!existsSync(fullPath)) continue
+          await searchDirectory(fullPath, folder)
+        }
+      } else {
+        await searchDirectory(MEMORY_PATH)
+      }
       
       return NextResponse.json({ 
         query,
@@ -256,6 +336,9 @@ export async function POST(request: NextRequest) {
     if (!path) {
       return NextResponse.json({ error: 'Path is required' }, { status: 400 })
     }
+    if (!isPathAllowed(path)) {
+      return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
+    }
 
     if (!MEMORY_PATH) {
       return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
@@ -268,8 +351,19 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Content is required for save action' }, { status: 400 })
       }
 
+      // Validate schema if present (warn but don't block save)
+      const schemaResult = path.endsWith('.md') ? validateSchema(content) : null
+      const schemaWarnings = schemaResult?.errors ?? []
+
       await writeFile(fullPath, content, 'utf-8')
-      return NextResponse.json({ success: true, message: 'File saved successfully' })
+      try {
+        db_helpers.logActivity('memory_file_saved', 'memory', 0, auth.user.username || 'unknown', `Updated ${path}`, { path, size: content.length })
+      } catch { /* best-effort */ }
+      return NextResponse.json({
+        success: true,
+        message: 'File saved successfully',
+        schemaWarnings,
+      })
     }
 
     if (action === 'create') {
@@ -292,6 +386,9 @@ export async function POST(request: NextRequest) {
       }
 
       await writeFile(fullPath, content || '', 'utf-8')
+      try {
+        db_helpers.logActivity('memory_file_created', 'memory', 0, auth.user.username || 'unknown', `Created ${path}`, { path })
+      } catch { /* best-effort */ }
       return NextResponse.json({ success: true, message: 'File created successfully' })
     }
 
@@ -316,6 +413,9 @@ export async function DELETE(request: NextRequest) {
     if (!path) {
       return NextResponse.json({ error: 'Path is required' }, { status: 400 })
     }
+    if (!isPathAllowed(path)) {
+      return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
+    }
 
     if (!MEMORY_PATH) {
       return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
@@ -331,6 +431,9 @@ export async function DELETE(request: NextRequest) {
       }
 
       await unlink(fullPath)
+      try {
+        db_helpers.logActivity('memory_file_deleted', 'memory', 0, auth.user.username || 'unknown', `Deleted ${path}`, { path })
+      } catch { /* best-effort */ }
       return NextResponse.json({ success: true, message: 'File deleted successfully' })
     }
 

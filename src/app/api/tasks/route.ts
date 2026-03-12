@@ -5,6 +5,9 @@ import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { validateBody, createTaskSchema, bulkUpdateTaskStatusSchema } from '@/lib/validation';
+import { resolveMentionRecipients } from '@/lib/mentions';
+import { normalizeTaskCreateStatus } from '@/lib/task-status';
+import { pushTaskToGitHub } from '@/lib/github-sync-engine';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -159,19 +162,28 @@ export async function POST(request: NextRequest) {
     const body = validated.data;
 
     const user = auth.user
+    const actor = user.display_name || user.username || 'system'
     const {
       title,
       description,
-      status = 'inbox',
+      status,
       priority = 'medium',
       project_id,
       assigned_to,
-      created_by = user?.username || 'system',
       due_date,
       estimated_hours,
+      actual_hours,
+      outcome,
+      error_message,
+      resolution,
+      feedback_rating,
+      feedback_notes,
+      retry_count = 0,
+      completed_at,
       tags = [],
       metadata = {}
     } = body;
+    const normalizedStatus = normalizeTaskCreateStatus(status, assigned_to)
     
     // Check for duplicate title
     const existingTask = db.prepare('SELECT id FROM tasks WHERE title = ? AND workspace_id = ?').get(title, workspaceId);
@@ -180,6 +192,16 @@ export async function POST(request: NextRequest) {
     }
     
     const now = Math.floor(Date.now() / 1000);
+    const mentionResolution = resolveMentionRecipients(description || '', db, workspaceId);
+    if (mentionResolution.unresolved.length > 0) {
+      return NextResponse.json({
+        error: `Unknown mentions: ${mentionResolution.unresolved.map((m) => `@${m}`).join(', ')}`,
+        missing_mentions: mentionResolution.unresolved
+      }, { status: 400 });
+    }
+
+    const resolvedCompletedAt = completed_at ?? (normalizedStatus === 'done' ? now : null)
+
     const createTaskTx = db.transaction(() => {
       const resolvedProjectId = resolveProjectId(db, workspaceId, project_id)
       db.prepare(`
@@ -196,23 +218,33 @@ export async function POST(request: NextRequest) {
       const insertStmt = db.prepare(`
         INSERT INTO tasks (
           title, description, status, priority, project_id, project_ticket_no, assigned_to, created_by,
-          created_at, updated_at, due_date, estimated_hours, tags, metadata, workspace_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          created_at, updated_at, due_date, estimated_hours, actual_hours,
+          outcome, error_message, resolution, feedback_rating, feedback_notes, retry_count, completed_at,
+          tags, metadata, workspace_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
 
       const dbResult = insertStmt.run(
         title,
         description,
-        status,
+        normalizedStatus,
         priority,
         resolvedProjectId,
         row.ticket_counter,
         assigned_to,
-        created_by,
+        actor,
         now,
         now,
         due_date,
         estimated_hours,
+        actual_hours,
+        outcome,
+        error_message,
+        resolution,
+        feedback_rating,
+        feedback_notes,
+        retry_count,
+        resolvedCompletedAt,
         JSON.stringify(tags),
         JSON.stringify(metadata),
         workspaceId
@@ -223,15 +255,30 @@ export async function POST(request: NextRequest) {
     const taskId = createTaskTx()
     
     // Log activity
-    db_helpers.logActivity('task_created', 'task', taskId, created_by, `Created task: ${title}`, {
+    db_helpers.logActivity('task_created', 'task', taskId, actor, `Created task: ${title}`, {
       title,
-      status,
+      status: normalizedStatus,
       priority,
-      assigned_to
+      assigned_to,
+      ...(outcome ? { outcome } : {})
     }, workspaceId);
 
-    if (created_by) {
-      db_helpers.ensureTaskSubscription(taskId, created_by, workspaceId)
+    if (actor) {
+      db_helpers.ensureTaskSubscription(taskId, actor, workspaceId)
+    }
+
+    for (const recipient of mentionResolution.recipients) {
+      db_helpers.ensureTaskSubscription(taskId, recipient, workspaceId);
+      if (recipient === actor) continue;
+      db_helpers.createNotification(
+        recipient,
+        'mention',
+        'You were mentioned in a task description',
+        `${actor} mentioned you in task "${title}"`,
+        'task',
+        taskId,
+        workspaceId
+      );
     }
 
     // Create notification if assigned
@@ -257,6 +304,19 @@ export async function POST(request: NextRequest) {
       WHERE t.id = ? AND t.workspace_id = ?
     `).get(taskId, workspaceId) as Task;
     const parsedTask = mapTaskRow(createdTask);
+
+    // Fire-and-forget outbound GitHub sync for new tasks
+    if (parsedTask.project_id) {
+      const project = db.prepare(`
+        SELECT id, github_repo, github_sync_enabled FROM projects
+        WHERE id = ? AND workspace_id = ?
+      `).get(parsedTask.project_id, workspaceId) as any
+      if (project?.github_sync_enabled && project?.github_repo) {
+        pushTaskToGitHub(parsedTask as any, project).catch(err =>
+          logger.error({ err, taskId }, 'Outbound GitHub sync failed for new task')
+        )
+      }
+    }
 
     // Broadcast to SSE clients
     eventBus.broadcast('task.created', parsedTask);
@@ -292,6 +352,11 @@ export async function PUT(request: NextRequest) {
       SET status = ?, updated_at = ?
       WHERE id = ? AND workspace_id = ?
     `);
+    const updateDoneStmt = db.prepare(`
+      UPDATE tasks
+      SET status = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
+      WHERE id = ? AND workspace_id = ?
+    `);
 
     const actor = auth.user.username
 
@@ -304,7 +369,11 @@ export async function PUT(request: NextRequest) {
           throw new Error(`Aegis approval required for task ${task.id}`)
         }
 
-        updateStmt.run(task.status, now, task.id, workspaceId);
+        if (task.status === 'done') {
+          updateDoneStmt.run(task.status, now, now, task.id, workspaceId);
+        } else {
+          updateStmt.run(task.status, now, task.id, workspaceId);
+        }
 
         // Log status change if different
         if (oldTask && oldTask.status !== task.status) {

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { authenticateUser, createSession } from '@/lib/auth'
 import { logAuditEvent } from '@/lib/db'
-import { getMcSessionCookieOptions } from '@/lib/session-cookie'
+import { getMcSessionCookieName, getMcSessionCookieOptions, isRequestSecure } from '@/lib/session-cookie'
 import { loginLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 
@@ -39,13 +39,14 @@ export async function POST(request: Request) {
         email: user.email || null,
         avatar_url: user.avatar_url || null,
         workspace_id: user.workspace_id ?? 1,
+        tenant_id: user.tenant_id ?? 1,
       },
     })
 
-    const isSecureRequest = request.headers.get('x-forwarded-proto') === 'https'
-      || new URL(request.url).protocol === 'https:'
+    const isSecureRequest = isRequestSecure(request)
+    const cookieName = getMcSessionCookieName(isSecureRequest)
 
-    response.cookies.set('mc-session', token, {
+    response.cookies.set(cookieName, token, {
       ...getMcSessionCookieOptions({ maxAgeSeconds: expiresAt - Math.floor(Date.now() / 1000), isSecureRequest }),
     })
 

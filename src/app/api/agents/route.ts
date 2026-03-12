@@ -8,6 +8,10 @@ import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { validateBody, createAgentSchema } from '@/lib/validation';
+import { runOpenClaw } from '@/lib/command';
+import { config as appConfig } from '@/lib/config';
+import { resolveWithin } from '@/lib/paths';
+import path from 'node:path';
 
 /**
  * GET /api/agents - List all agents with optional filtering
@@ -54,27 +58,57 @@ export async function GET(request: NextRequest) {
       config: enrichAgentConfigFromWorkspace(agent.config ? JSON.parse(agent.config) : {})
     }));
     
-    // Get task counts for each agent (prepare once, reuse per agent)
-    const taskCountStmt = db.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as assigned,
-        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
-        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as completed
-      FROM tasks
-      WHERE assigned_to = ? AND workspace_id = ?
-    `);
+    // Get task counts for all listed agents in one query (avoids N+1 queries)
+    const agentNames = agentsWithParsedData.map(agent => agent.name).filter(Boolean)
+    const taskStatsByAgent = new Map<string, { total: number; assigned: number; in_progress: number; quality_review: number; done: number }>()
+
+    if (agentNames.length > 0) {
+      const placeholders = agentNames.map(() => '?').join(', ')
+      const groupedTaskStats = db.prepare(`
+        SELECT
+          assigned_to,
+          COUNT(*) as total,
+          SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as assigned,
+          SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
+          SUM(CASE WHEN status = 'quality_review' THEN 1 ELSE 0 END) as quality_review,
+          SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done
+        FROM tasks
+        WHERE workspace_id = ? AND assigned_to IN (${placeholders})
+        GROUP BY assigned_to
+      `).all(workspaceId, ...agentNames) as Array<{
+        assigned_to: string
+        total: number | null
+        assigned: number | null
+        in_progress: number | null
+        quality_review: number | null
+        done: number | null
+      }>
+
+      for (const row of groupedTaskStats) {
+        taskStatsByAgent.set(row.assigned_to, {
+          total: row.total || 0,
+          assigned: row.assigned || 0,
+          in_progress: row.in_progress || 0,
+          quality_review: row.quality_review || 0,
+          done: row.done || 0,
+        })
+      }
+    }
 
     const agentsWithStats = agentsWithParsedData.map(agent => {
-      const taskStats = taskCountStmt.get(agent.name, workspaceId) as any;
+      const taskStats = taskStatsByAgent.get(agent.name) || {
+        total: 0,
+        assigned: 0,
+        in_progress: 0,
+        quality_review: 0,
+        done: 0,
+      }
 
       return {
         ...agent,
         taskStats: {
-          total: taskStats.total || 0,
-          assigned: taskStats.assigned || 0,
-          in_progress: taskStats.in_progress || 0,
-          completed: taskStats.completed || 0
+          ...taskStats,
+          completed: taskStats.done,
         }
       };
     });
@@ -123,6 +157,7 @@ export async function POST(request: NextRequest) {
 
     const {
       name,
+      openclaw_id,
       role,
       session_key,
       soul_content,
@@ -130,8 +165,15 @@ export async function POST(request: NextRequest) {
       config = {},
       template,
       gateway_config,
-      write_to_gateway
+      write_to_gateway,
+      provision_openclaw_workspace,
+      openclaw_workspace_path
     } = body;
+
+    const openclawId = (openclaw_id || name || 'agent')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
 
     // Resolve template if specified
     let finalRole = role;
@@ -157,6 +199,32 @@ export async function POST(request: NextRequest) {
       .get(name, workspaceId);
     if (existingAgent) {
       return NextResponse.json({ error: 'Agent name already exists' }, { status: 409 });
+    }
+
+    if (provision_openclaw_workspace) {
+      if (!appConfig.openclawStateDir) {
+        return NextResponse.json(
+          { error: 'OPENCLAW_STATE_DIR is not configured; cannot provision OpenClaw workspace' },
+          { status: 500 }
+        );
+      }
+
+      const workspacePath = openclaw_workspace_path
+        ? path.resolve(openclaw_workspace_path)
+        : resolveWithin(appConfig.openclawStateDir, path.join('workspaces', openclawId));
+
+      try {
+        await runOpenClaw(
+          ['agents', 'add', openclawId, '--workspace', workspacePath, '--non-interactive'],
+          { timeoutMs: 20000 }
+        );
+      } catch (provisionError: any) {
+        logger.error({ err: provisionError, openclawId, workspacePath }, 'OpenClaw workspace provisioning failed');
+        return NextResponse.json(
+          { error: provisionError?.message || 'Failed to provision OpenClaw agent workspace' },
+          { status: 502 }
+        );
+      }
     }
     
     const now = Math.floor(Date.now() / 1000);
@@ -206,7 +274,7 @@ export async function POST(request: NextRequest) {
     const parsedAgent = {
       ...createdAgent,
       config: JSON.parse(createdAgent.config || '{}'),
-      taskStats: { total: 0, assigned: 0, in_progress: 0, completed: 0 }
+      taskStats: { total: 0, assigned: 0, in_progress: 0, quality_review: 0, done: 0, completed: 0 }
     };
 
     // Broadcast to SSE clients
@@ -215,7 +283,6 @@ export async function POST(request: NextRequest) {
     // Write to gateway config if requested
     if (write_to_gateway && finalConfig) {
       try {
-        const openclawId = (name || 'agent').toLowerCase().replace(/\s+/g, '-');
         await writeAgentToConfig({
           id: openclawId,
           name,

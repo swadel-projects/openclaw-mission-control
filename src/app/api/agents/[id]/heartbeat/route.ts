@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase, db_helpers } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
+import { agentHeartbeatLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
+import { resolveTaskImplementationTarget } from '@/lib/task-routing';
 
 /**
  * GET /api/agents/[id]/heartbeat - Agent heartbeat check
@@ -79,8 +81,8 @@ export async function GET(
       AND status IN ('assigned', 'in_progress')
       ORDER BY priority DESC, created_at ASC
       LIMIT 10
-    `).all(agent.name, workspaceId);
-    
+    `).all(agent.name, workspaceId) as any[];
+
     if (assignedTasks.length > 0) {
       workItems.push({
         type: 'assigned_tasks',
@@ -90,7 +92,8 @@ export async function GET(
           title: t.title,
           status: t.status,
           priority: t.priority,
-          due_date: t.due_date
+          due_date: t.due_date,
+          ...resolveTaskImplementationTarget(t),
         }))
       });
     }
@@ -180,7 +183,7 @@ export async function GET(
  * - connection_id: update direct_connections.last_heartbeat
  * - status: agent status override
  * - last_activity: activity description
- * - token_usage: { model, inputTokens, outputTokens } for inline token reporting
+ * - token_usage: { model, inputTokens, outputTokens, taskId? } for inline token reporting
  */
 export async function POST(
   request: NextRequest,
@@ -188,6 +191,9 @@ export async function POST(
 ) {
   const auth = requireRole(request, 'operator');
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
+  const rateLimited = agentHeartbeatLimiter(request);
+  if (rateLimited) return rateLimited;
 
   let body: any = {};
   try {
@@ -221,10 +227,35 @@ export async function POST(
 
     if (agent) {
       const sessionId = `${agent.name}:cli`;
+      const parsedTaskId =
+        token_usage.taskId != null && Number.isFinite(Number(token_usage.taskId))
+          ? Number(token_usage.taskId)
+          : null
+
+      let taskId: number | null = null
+      if (parsedTaskId && parsedTaskId > 0) {
+        const taskRow = db.prepare(
+          'SELECT id FROM tasks WHERE id = ? AND workspace_id = ?'
+        ).get(parsedTaskId, workspaceId) as { id?: number } | undefined
+        if (taskRow?.id) {
+          taskId = taskRow.id
+        } else {
+          logger.warn({ taskId: parsedTaskId, workspaceId, agent: agent.name }, 'Ignoring token usage with unknown taskId')
+        }
+      }
+
       db.prepare(
-        `INSERT INTO token_usage (model, session_id, input_tokens, output_tokens, created_at)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(token_usage.model, sessionId, token_usage.inputTokens, token_usage.outputTokens, now);
+        `INSERT INTO token_usage (model, session_id, input_tokens, output_tokens, created_at, workspace_id, task_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        token_usage.model,
+        sessionId,
+        token_usage.inputTokens,
+        token_usage.outputTokens,
+        now,
+        workspaceId,
+        taskId
+      );
       tokenRecorded = true;
     }
   }

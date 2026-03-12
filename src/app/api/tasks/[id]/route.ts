@@ -5,6 +5,9 @@ import { requireRole } from '@/lib/auth';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { validateBody, updateTaskSchema } from '@/lib/validation';
+import { resolveMentionRecipients } from '@/lib/mentions';
+import { normalizeTaskUpdateStatus } from '@/lib/task-status';
+import { pushTaskToGitHub } from '@/lib/github-sync-engine';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -114,18 +117,42 @@ export async function PUT(
     const {
       title,
       description,
-      status,
+      status: requestedStatus,
       priority,
       project_id,
       assigned_to,
       due_date,
       estimated_hours,
       actual_hours,
+      outcome,
+      error_message,
+      resolution,
+      feedback_rating,
+      feedback_notes,
+      retry_count,
+      completed_at,
       tags,
       metadata
     } = body;
+    const normalizedStatus = normalizeTaskUpdateStatus({
+      currentStatus: currentTask.status,
+      requestedStatus,
+      assignedTo: assigned_to,
+      assignedToProvided: assigned_to !== undefined,
+    })
     
     const now = Math.floor(Date.now() / 1000);
+    const descriptionMentionResolution = description !== undefined
+      ? resolveMentionRecipients(description || '', db, workspaceId)
+      : null;
+    if (descriptionMentionResolution && descriptionMentionResolution.unresolved.length > 0) {
+      return NextResponse.json({
+        error: `Unknown mentions: ${descriptionMentionResolution.unresolved.map((m) => `@${m}`).join(', ')}`,
+        missing_mentions: descriptionMentionResolution.unresolved
+      }, { status: 400 });
+    }
+
+    const previousDescriptionMentionRecipients = resolveMentionRecipients(currentTask.description || '', db, workspaceId).recipients;
     
     // Build dynamic update query
     const fieldsToUpdate = [];
@@ -140,15 +167,15 @@ export async function PUT(
       fieldsToUpdate.push('description = ?');
       updateParams.push(description);
     }
-    if (status !== undefined) {
-      if (status === 'done' && !hasAegisApproval(db, taskId, workspaceId)) {
+    if (normalizedStatus !== undefined) {
+      if (normalizedStatus === 'done' && !hasAegisApproval(db, taskId, workspaceId)) {
         return NextResponse.json(
           { error: 'Aegis approval is required to move task to done.' },
           { status: 403 }
         )
       }
       fieldsToUpdate.push('status = ?');
-      updateParams.push(status);
+      updateParams.push(normalizedStatus);
     }
     if (priority !== undefined) {
       fieldsToUpdate.push('priority = ?');
@@ -200,6 +227,37 @@ export async function PUT(
       fieldsToUpdate.push('actual_hours = ?');
       updateParams.push(actual_hours);
     }
+    if (outcome !== undefined) {
+      fieldsToUpdate.push('outcome = ?');
+      updateParams.push(outcome);
+    }
+    if (error_message !== undefined) {
+      fieldsToUpdate.push('error_message = ?');
+      updateParams.push(error_message);
+    }
+    if (resolution !== undefined) {
+      fieldsToUpdate.push('resolution = ?');
+      updateParams.push(resolution);
+    }
+    if (feedback_rating !== undefined) {
+      fieldsToUpdate.push('feedback_rating = ?');
+      updateParams.push(feedback_rating);
+    }
+    if (feedback_notes !== undefined) {
+      fieldsToUpdate.push('feedback_notes = ?');
+      updateParams.push(feedback_notes);
+    }
+    if (retry_count !== undefined) {
+      fieldsToUpdate.push('retry_count = ?');
+      updateParams.push(retry_count);
+    }
+    if (completed_at !== undefined) {
+      fieldsToUpdate.push('completed_at = ?');
+      updateParams.push(completed_at);
+    } else if (normalizedStatus === 'done' && !currentTask.completed_at) {
+      fieldsToUpdate.push('completed_at = ?');
+      updateParams.push(now);
+    }
     if (tags !== undefined) {
       fieldsToUpdate.push('tags = ?');
       updateParams.push(JSON.stringify(tags));
@@ -228,8 +286,8 @@ export async function PUT(
     // Track changes and log activities
     const changes: string[] = [];
     
-    if (status && status !== currentTask.status) {
-      changes.push(`status: ${currentTask.status} → ${status}`);
+    if (normalizedStatus !== undefined && normalizedStatus !== currentTask.status) {
+      changes.push(`status: ${currentTask.status} → ${normalizedStatus}`);
       
       // Create notification for status change if assigned
       if (currentTask.assigned_to) {
@@ -237,7 +295,7 @@ export async function PUT(
           currentTask.assigned_to,
           'status_change',
           'Task Status Updated',
-          `Task "${currentTask.title}" status changed to ${status}`,
+          `Task "${currentTask.title}" status changed to ${normalizedStatus}`,
           'task',
           taskId,
           workspaceId
@@ -274,6 +332,28 @@ export async function PUT(
     if (project_id !== undefined && project_id !== currentTask.project_id) {
       changes.push(`project: ${currentTask.project_id || 'none'} → ${project_id}`);
     }
+    if (outcome !== undefined && outcome !== currentTask.outcome) {
+      changes.push(`outcome: ${currentTask.outcome || 'unset'} → ${outcome || 'unset'}`);
+    }
+
+    if (descriptionMentionResolution) {
+      const newMentionRecipients = new Set(descriptionMentionResolution.recipients);
+      const previousRecipients = new Set(previousDescriptionMentionRecipients);
+      for (const recipient of newMentionRecipients) {
+        if (previousRecipients.has(recipient)) continue;
+        db_helpers.ensureTaskSubscription(taskId, recipient, workspaceId);
+        if (recipient === auth.user.username) continue;
+        db_helpers.createNotification(
+          recipient,
+          'mention',
+          'You were mentioned in a task description',
+          `${auth.user.username} mentioned you in task "${title || currentTask.title}"`,
+          'task',
+          taskId,
+          workspaceId
+        );
+      }
+    }
     
     // Log activity if there were meaningful changes
     if (changes.length > 0) {
@@ -291,7 +371,7 @@ export async function PUT(
             priority: currentTask.priority,
             assigned_to: currentTask.assigned_to
           },
-          newValues: { title, status, priority, assigned_to }
+          newValues: { title, status: normalizedStatus ?? currentTask.status, priority, assigned_to }
         },
         workspaceId
       );
@@ -305,6 +385,22 @@ export async function PUT(
       WHERE t.id = ? AND t.workspace_id = ?
     `).get(taskId, workspaceId) as Task;
     const parsedTask = mapTaskRow(updatedTask);
+
+    // Fire-and-forget outbound GitHub sync for relevant changes
+    const syncRelevantChanges = changes.some(c =>
+      c.startsWith('status:') || c.startsWith('priority:') || c.includes('title') || c.includes('assigned')
+    )
+    if (syncRelevantChanges && (updatedTask as any).github_repo) {
+      const project = db.prepare(`
+        SELECT id, github_repo, github_sync_enabled FROM projects
+        WHERE id = ? AND workspace_id = ?
+      `).get((updatedTask as any).project_id, workspaceId) as any
+      if (project?.github_sync_enabled) {
+        pushTaskToGitHub(updatedTask as any, project).catch(err =>
+          logger.error({ err, taskId }, 'Outbound GitHub sync failed')
+        )
+      }
+    }
 
     // Broadcast to SSE clients
     eventBus.broadcast('task.updated', parsedTask);

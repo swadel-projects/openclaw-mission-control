@@ -95,18 +95,6 @@ async function saveCronFile(data: OpenClawCronFile): Promise<boolean> {
   }
 }
 
-/** Deduplicate jobs by name — keep the latest (by createdAtMs) per unique name */
-function deduplicateJobs(jobs: OpenClawCronJob[]): OpenClawCronJob[] {
-  const latest = new Map<string, OpenClawCronJob>()
-  for (const job of jobs) {
-    const existing = latest.get(job.name)
-    if (!existing || (job.createdAtMs ?? 0) > (existing.createdAtMs ?? 0)) {
-      latest.set(job.name, job)
-    }
-  }
-  return [...latest.values()]
-}
-
 function mapLastStatus(status?: string): 'success' | 'error' | 'running' | undefined {
   if (!status) return undefined
   const s = status.toLowerCase()
@@ -157,7 +145,7 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ jobs: [] })
       }
 
-      const jobs = deduplicateJobs(cronFile.jobs).map(mapOpenClawJob)
+      const jobs = cronFile.jobs.map(mapOpenClawJob)
       return NextResponse.json({ jobs })
     }
 
@@ -198,6 +186,71 @@ export async function GET(request: NextRequest) {
       }
 
       return NextResponse.json({ logs })
+    }
+
+    if (action === 'history') {
+      const jobId = searchParams.get('jobId')
+      if (!jobId) {
+        return NextResponse.json({ error: 'Job ID required' }, { status: 400 })
+      }
+
+      const page = parseInt(searchParams.get('page') || '1', 10)
+      const query = searchParams.get('query') || ''
+
+      // Try to load run history from the cron runs log file
+      const openclawStateDir = config.openclawStateDir
+      if (!openclawStateDir) {
+        return NextResponse.json({ entries: [], total: 0, hasMore: false })
+      }
+
+      try {
+        const runsPath = path.join(openclawStateDir, 'cron', 'runs.json')
+        const raw = await readFile(runsPath, 'utf-8')
+        const runsData = JSON.parse(raw)
+        let entries: any[] = Array.isArray(runsData.runs) ? runsData.runs : Array.isArray(runsData) ? runsData : []
+
+        // Filter to this job
+        entries = entries.filter((r: any) => r.jobId === jobId || r.id === jobId)
+
+        // Apply search filter
+        if (query) {
+          const q = query.toLowerCase()
+          entries = entries.filter((r: any) =>
+            (r.status || '').toLowerCase().includes(q) ||
+            (r.error || '').toLowerCase().includes(q) ||
+            (r.deliveryStatus || '').toLowerCase().includes(q)
+          )
+        }
+
+        // Sort by timestamp descending
+        entries.sort((a: any, b: any) => (b.timestamp || b.startedAtMs || 0) - (a.timestamp || a.startedAtMs || 0))
+
+        const pageSize = 20
+        const start = (page - 1) * pageSize
+        const paged = entries.slice(start, start + pageSize)
+
+        return NextResponse.json({
+          entries: paged,
+          total: entries.length,
+          hasMore: start + pageSize < entries.length,
+          page,
+        })
+      } catch {
+        // No runs file — fall back to state-based info
+        const cronFile = await loadCronFile()
+        const job = cronFile?.jobs.find(j => j.id === jobId || j.name === jobId)
+        const entries: any[] = []
+        if (job?.state?.lastRunAtMs) {
+          entries.push({
+            jobId: job.id,
+            status: job.state.lastStatus || 'unknown',
+            timestamp: job.state.lastRunAtMs,
+            durationMs: job.state.lastDurationMs,
+            error: job.state.lastError,
+          })
+        }
+        return NextResponse.json({ entries, total: entries.length, hasMore: false, page: 1 })
+      }
     }
 
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
@@ -261,11 +314,14 @@ export async function POST(request: NextRequest) {
       }
 
       // For OpenClaw cron jobs, trigger via the openclaw CLI
+      const triggerMode = body.mode || 'force'
       const { runCommand } = await import('@/lib/command')
       try {
-        const { stdout, stderr } = await runCommand(config.openclawBin, [
-          'cron', 'trigger', job.id
-        ], { timeoutMs: 30000 })
+        const args = ['cron', 'trigger', job.id]
+        if (triggerMode === 'due') {
+          args.push('--if-due')
+        }
+        const { stdout, stderr } = await runCommand(config.openclawBin, args, { timeoutMs: 30000 })
 
         return NextResponse.json({
           success: true,
@@ -308,7 +364,7 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'add') {
-      const { schedule, command, model, description } = body
+      const { schedule, command, model, description, staggerSeconds } = body
       const name = jobName || body.name
       if (!schedule || !command || !name) {
         return NextResponse.json(
@@ -332,6 +388,9 @@ export async function POST(request: NextRequest) {
         schedule: {
           kind: 'cron',
           expr: schedule,
+          ...(typeof staggerSeconds === 'number' && staggerSeconds > 0
+            ? { staggerMs: staggerSeconds * 1000 } as any
+            : {}),
         },
         payload: {
           kind: 'agentTurn',
@@ -351,6 +410,49 @@ export async function POST(request: NextRequest) {
       }
 
       return NextResponse.json({ success: true })
+    }
+
+    if (action === 'clone') {
+      const id = jobId || jobName
+      if (!id) {
+        return NextResponse.json({ error: 'Job ID required' }, { status: 400 })
+      }
+
+      const cronFile = await loadCronFile()
+      if (!cronFile) {
+        return NextResponse.json({ error: 'Cron file not found' }, { status: 404 })
+      }
+
+      const sourceJob = cronFile.jobs.find(j => j.id === id || j.name === id)
+      if (!sourceJob) {
+        return NextResponse.json({ error: 'Job not found' }, { status: 404 })
+      }
+
+      // Generate unique clone name
+      const existingNames = new Set(cronFile.jobs.map(j => j.name.toLowerCase()))
+      let cloneName = `${sourceJob.name} (copy)`
+      let counter = 2
+      while (existingNames.has(cloneName.toLowerCase())) {
+        cloneName = `${sourceJob.name} (copy ${counter})`
+        counter++
+      }
+
+      const clonedJob: OpenClawCronJob = {
+        ...JSON.parse(JSON.stringify(sourceJob)),
+        id: `mc-${Date.now().toString(36)}`,
+        name: cloneName,
+        createdAtMs: Date.now(),
+        updatedAtMs: Date.now(),
+        state: {},
+      }
+
+      cronFile.jobs.push(clonedJob)
+
+      if (!(await saveCronFile(cronFile))) {
+        return NextResponse.json({ error: 'Failed to save cron file' }, { status: 500 })
+      }
+
+      return NextResponse.json({ success: true, clonedName: cloneName })
     }
 
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 })

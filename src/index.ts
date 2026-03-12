@@ -70,6 +70,8 @@ export interface TokenUsage {
   outputTokens: number
   totalTokens: number
   cost: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
 }
 
 export interface ModelConfig {
@@ -99,6 +101,13 @@ export interface Task {
   due_date?: number
   estimated_hours?: number
   actual_hours?: number
+  outcome?: 'success' | 'failed' | 'partial' | 'abandoned'
+  error_message?: string
+  resolution?: string
+  feedback_rating?: number
+  feedback_notes?: string
+  retry_count?: number
+  completed_at?: number
   tags?: string[]
   metadata?: any
 }

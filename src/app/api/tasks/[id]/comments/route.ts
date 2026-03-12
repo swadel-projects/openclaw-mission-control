@@ -4,6 +4,7 @@ import { requireRole } from '@/lib/auth';
 import { validateBody, createCommentSchema } from '@/lib/validation';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
+import { resolveMentionRecipients } from '@/lib/mentions';
 
 /**
  * GET /api/tasks/[id]/comments - Get all comments for a task
@@ -108,8 +109,31 @@ export async function POST(
 
     const result = await validateBody(request, createCommentSchema);
     if ('error' in result) return result.error;
-    const { content, author = 'system', parent_id } = result.data;
-    
+    const { content: rawContent, parent_id } = result.data;
+    const author = auth.user.display_name || auth.user.username || 'system';
+
+    // Normalize agent payload JSON — extract text from OpenClaw result format
+    let content = rawContent;
+    try {
+      const stripped = rawContent.replace(/\x1b\[[0-9;]*m/g, '').replace(/\[3[0-9]m/g, '').replace(/\[39m/g, '');
+      const parsed = JSON.parse(stripped);
+      if (parsed && typeof parsed === 'object' && Array.isArray(parsed.payloads)) {
+        const text = parsed.payloads
+          .map((p: any) => (typeof p === 'string' ? p : p?.text || '').trim())
+          .filter(Boolean)
+          .join('\n');
+        if (text) {
+          const meta = parsed.meta?.agentMeta;
+          const metaLine = meta
+            ? `\n\n_${[meta.model, meta.usage?.total ? `${meta.usage.total} tokens` : '', parsed.meta?.durationMs ? `${(parsed.meta.durationMs / 1000).toFixed(1)}s` : ''].filter(Boolean).join(' · ')}_`
+            : '';
+          content = text + metaLine;
+        }
+      }
+    } catch {
+      // Not JSON — keep original content
+    }
+
     // Verify task exists
     const task = db
       .prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?')
@@ -128,8 +152,13 @@ export async function POST(
       }
     }
     
-    // Parse @mentions from content
-    const mentions = db_helpers.parseMentions(content);
+    const mentionResolution = resolveMentionRecipients(content, db, workspaceId);
+    if (mentionResolution.unresolved.length > 0) {
+      return NextResponse.json({
+        error: `Unknown mentions: ${mentionResolution.unresolved.map((m) => `@${m}`).join(', ')}`,
+        missing_mentions: mentionResolution.unresolved
+      }, { status: 400 });
+    }
     
     const now = Math.floor(Date.now() / 1000);
     
@@ -145,7 +174,7 @@ export async function POST(
       content,
       now,
       parent_id || null,
-      mentions.length > 0 ? JSON.stringify(mentions) : null,
+      mentionResolution.tokens.length > 0 ? JSON.stringify(mentionResolution.tokens) : null,
       workspaceId
     );
 
@@ -166,7 +195,7 @@ export async function POST(
         task_id: taskId,
         task_title: task.title,
         parent_id,
-        mentions,
+        mentions: mentionResolution.tokens,
         content_preview: content.substring(0, 100)
       },
       workspaceId
@@ -174,9 +203,9 @@ export async function POST(
     
     // Ensure subscriptions for author, mentions, and assignee
     db_helpers.ensureTaskSubscription(taskId, author, workspaceId);
-    const uniqueMentions = Array.from(new Set(mentions));
-    uniqueMentions.forEach((mentionedAgent) => {
-      db_helpers.ensureTaskSubscription(taskId, mentionedAgent, workspaceId);
+    const mentionRecipients = mentionResolution.recipients;
+    mentionRecipients.forEach((mentionedRecipient) => {
+      db_helpers.ensureTaskSubscription(taskId, mentionedRecipient, workspaceId);
     });
     if (task.assigned_to) {
       db_helpers.ensureTaskSubscription(taskId, task.assigned_to, workspaceId);
@@ -185,7 +214,7 @@ export async function POST(
     // Notify subscribers
     const subscribers = new Set(db_helpers.getTaskSubscribers(taskId, workspaceId));
     subscribers.delete(author);
-    const mentionSet = new Set(uniqueMentions);
+    const mentionSet = new Set(mentionRecipients);
 
     for (const subscriber of subscribers) {
       const isMention = mentionSet.has(subscriber);

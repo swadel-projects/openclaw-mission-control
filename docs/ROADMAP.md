@@ -15,6 +15,7 @@ This file tracks every customization and feature goal for Scott's Windows-first,
 
 These are complete and should be preserved across future changes.
 
+- [x] **Upstream v2.0.0 merge** — 90-commit upstream upgrade (eaf0bb1). Memory graph, onboarding wizard, security audit, exec approvals, multi-gateway, multi-tenant, injection guard, audit logging, and more. Retrospective: [`docs/plans/2026-03-12-v2-upgrade.md`](plans/2026-03-12-v2-upgrade.md)
 - [x] **Windows CLI invocation hardening** — `shell:false` + `node.exe openclaw.mjs …args` everywhere; no shell-shim arg mangling.
 - [x] **Coordinator chat reliability** — fallback to `openclaw agent --agent coordinator --json` when gateway completion returns no text.
 - [x] **Sync-from-config path resolution (Windows)** — all sync paths honor `OPENCLAW_CONFIG_PATH` before falling back to `{OPENCLAW_HOME}/.openclaw/openclaw.json`.
