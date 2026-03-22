@@ -314,14 +314,9 @@ interface ReviewableTask {
   project_ticket_no: number | null
 }
 
-function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
-  if (task.agent_config) {
-    try {
-      const cfg = JSON.parse(task.agent_config)
-      if (typeof cfg.openclawId === 'string' && cfg.openclawId) return cfg.openclawId
-    } catch { /* ignore */ }
-  }
-  return task.assigned_to || 'jarv'
+function resolveGatewayAgentIdForReview(_task: ReviewableTask): string {
+  // Use MC_REVIEWER_AGENT env var, defaulting to bertha-coordinator
+  return (process.env.MC_REVIEWER_AGENT || 'bertha-coordinator').trim()
 }
 
 function buildReviewPrompt(task: ReviewableTask): string {
@@ -735,7 +730,9 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         }
         // Route to appropriate model tier based on task complexity.
         // null = no override, agent uses its own configured default model.
-        if (dispatchModel) invokeParams.model = dispatchModel
+        // Note: OpenClaw gateway 'agent' command does not accept a 'model' param.
+        // Model routing is handled by agent config, not dispatch params.
+        // if (dispatchModel) invokeParams.model = dispatchModel
 
         // Use --expect-final to block until the agent completes and returns the full
         // response payload (result.payloads[0].text). The two-step agent → agent.wait
