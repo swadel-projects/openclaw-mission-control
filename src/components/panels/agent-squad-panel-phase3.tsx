@@ -1,4 +1,4 @@
-'use client'
+﻿'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslations } from 'next-intl'
@@ -209,7 +209,7 @@ export function AgentSquadPanelPhase3() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: `🤖 **Wake Up Call**\n\nAgent ${agentName}, you have been manually woken up.\nCheck Mission Control for any pending tasks or notifications.\n\n⏰ ${new Date().toLocaleString()}`
+          message: `ðŸ¤– **Wake Up Call**\n\nAgent ${agentName}, you have been manually woken up.\nCheck Mission Control for any pending tasks or notifications.\n\nâ° ${new Date().toLocaleString()}`
         })
       })
 
@@ -394,7 +394,7 @@ export function AgentSquadPanelPhase3() {
             size="icon-sm"
             className="text-red-400/60 hover:text-red-400 ml-2"
           >
-            ×
+            Ã—
           </Button>
         </div>
       )}
@@ -432,7 +432,7 @@ export function AgentSquadPanelPhase3() {
                   {/* Header: avatar + name + status */}
                   <div className="flex items-start justify-between mb-2">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <AgentAvatar name={agent.name} size="md" />
+                      <AgentAvatar name={agent.name} agentId={agent.config?.openclawId ?? agent.name?.toLowerCase()} size="lg" />
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <h3 className="font-semibold text-foreground truncate">{agent.name}</h3>
@@ -449,7 +449,7 @@ export function AgentSquadPanelPhase3() {
                           )}
                         </div>
                         <p className="text-xs text-muted-foreground truncate">
-                          {agent.role}{modelName && <> · <span className="font-mono text-muted-foreground/80">{modelName}</span></>}
+                          {agent.role}{modelName && <> Â· <span className="font-mono text-muted-foreground/80">{modelName}</span></>}
                         </p>
                       </div>
                     </div>
@@ -465,12 +465,12 @@ export function AgentSquadPanelPhase3() {
                     </div>
                   </div>
 
-                  {/* Task stats — inline */}
+                  {/* Task stats â€” inline */}
                   {taskStatsLine && (
                     <div className="text-xs text-muted-foreground mb-2 pl-0.5">
                       {taskStatsLine.map((part, i) => (
                         <span key={part.label}>
-                          {i > 0 && <span className="mx-1 text-muted-foreground/40">·</span>}
+                          {i > 0 && <span className="mx-1 text-muted-foreground/40">Â·</span>}
                           <span className={part.color || 'text-foreground/80'}>{part.count}</span>
                           {' '}{part.label}
                         </span>
@@ -864,7 +864,7 @@ function AgentDetailModalPhase3({
         <div className="px-5 pt-5 pb-0 border-b border-border">
           <div className="flex justify-between items-center gap-4 mb-4">
             <div className="flex items-center gap-3 min-w-0">
-              <AgentAvatar name={agent.name} size="md" />
+              <AgentAvatar name={agent.name} agentId={agent.config?.openclawId ?? agent.name?.toLowerCase()} size="lg" />
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <h3 className="text-lg font-semibold text-foreground leading-tight truncate">{agentState.name}</h3>
@@ -880,7 +880,7 @@ function AgentDetailModalPhase3({
                 </div>
                 <div className="flex items-center gap-2 mt-0.5">
                   <span className="text-sm text-muted-foreground">{agentState.role}</span>
-                  <span className="text-xs text-muted-foreground/60">·</span>
+                  <span className="text-xs text-muted-foreground/60">Â·</span>
                   <span className="text-xs text-muted-foreground/60">seen {formatLastSeen(agentState.last_seen)}</span>
                 </div>
               </div>
@@ -1121,7 +1121,7 @@ function QuickSpawnModal({
           <h3 className="text-lg font-bold text-foreground">
             Quick Spawn for {agent.name}
           </h3>
-          <Button onClick={onClose} variant="ghost" size="icon-sm" className="text-2xl">×</Button>
+          <Button onClick={onClose} variant="ghost" size="icon-sm" className="text-2xl">Ã—</Button>
         </div>
 
         {spawnResult ? (
@@ -1220,3 +1220,5 @@ function QuickSpawnModal({
 }
 
 export default AgentSquadPanelPhase3
+
+
