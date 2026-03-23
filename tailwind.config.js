@@ -102,8 +102,13 @@ module.exports = {
         'mc-fade-in': 'mcFadeIn 0.7s cubic-bezier(0.16, 1, 0.3, 1) 2.0s forwards',
         'grid-flow': 'gridFlow 20s linear infinite',
         'edge-glow': 'edgeGlow 2s ease-in-out infinite',
+        'recording-pulse': 'recordingPulse 1.5s ease-in-out infinite',
       },
       keyframes: {
+        recordingPulse: {
+          '0%, 100%': { opacity: '1', boxShadow: '0 0 0 0 rgba(248, 113, 113, 0.4)' },
+          '50%': { opacity: '0.8', boxShadow: '0 0 0 6px rgba(248, 113, 113, 0)' },
+        },
         glowPulse: {
           '0%, 100%': { opacity: '1', filter: 'brightness(1)' },
           '50%': { opacity: '0.7', filter: 'brightness(1.3)' },
