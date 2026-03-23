@@ -7,6 +7,7 @@ import { createClientLogger } from '@/lib/client-logger'
 import { ConversationList } from './conversation-list'
 import { MessageList } from './message-list'
 import { ChatInput } from './chat-input'
+import { MicButton } from '@/components/ui/mic-button'
 import { Button } from '@/components/ui/button'
 import { SessionMessage, shouldShowTimestamp, type SessionTranscriptMessage } from './session-message'
 import { getSessionKindLabel, SessionKindAvatar } from './session-kind-brand'
@@ -667,6 +668,15 @@ function SessionConversationView({
       <div className="border-t border-border/50 px-4 py-2">
         <div className="flex items-center gap-2">
           <span className={`font-mono-tight text-xs ${isGatewaySession ? 'text-cyan-400/60' : 'text-green-400/60'}`}>{isGatewaySession ? '>' : '$'}</span>
+          <MicButton
+            onTranscript={(text) => {
+              setContinuePrompt((prev) => {
+                const separator = prev.length > 0 && !prev.endsWith(' ') ? ' ' : ''
+                return prev + separator + text
+              })
+            }}
+            disabled={continueBusy}
+          />
           <input
             value={continuePrompt}
             onChange={(e) => setContinuePrompt(e.target.value)}

@@ -28,7 +28,7 @@ export async function POST(request: NextRequest) {
 
     const whisperForm = new FormData()
     whisperForm.append('file', audio, 'audio.webm')
-    whisperForm.append('model', 'whisper-1')
+    whisperForm.append('model', 'gpt-4o-mini-transcribe')
     whisperForm.append('language', 'en')
     whisperForm.append('response_format', 'json')
 

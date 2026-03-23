@@ -17,7 +17,7 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
     log.warn('Mic error', { error: msg })
   }, [])
 
-  const { isRecording, isTranscribing, isSupported, startRecording, stopRecording } =
+  const { isRecording, isTranscribing, isSupported, toggleRecording } =
     usePushToTalk({ onTranscript, onError: handleError })
 
   if (!isSupported) return null
@@ -25,8 +25,8 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
   const title = isTranscribing
     ? 'Transcribing...'
     : isRecording
-      ? 'Release to stop'
-      : 'Hold to record'
+      ? 'Click to stop'
+      : 'Click to record'
 
   return (
     <Button
@@ -35,13 +35,8 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
       className={`rounded-lg flex-shrink-0 ${isRecording ? 'text-red-400 animate-recording-pulse' : ''}`}
       title={title}
       disabled={disabled || isTranscribing}
-      onMouseDown={() => startRecording()}
-      onMouseUp={() => stopRecording()}
-      onMouseLeave={() => { if (isRecording) stopRecording() }}
-      onTouchStart={(e) => { e.preventDefault(); startRecording() }}
-      onTouchEnd={(e) => { e.preventDefault(); stopRecording() }}
+      onClick={toggleRecording}
       onContextMenu={(e) => e.preventDefault()}
-      style={{ touchAction: 'none' }}
     >
       {isTranscribing ? (
         <span
