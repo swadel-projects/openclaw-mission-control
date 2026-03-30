@@ -8,13 +8,16 @@ const log = createClientLogger('PushToTalk')
 export interface UsePushToTalkOptions {
   onTranscript: (text: string) => void
   onError?: (error: string) => void
+  /** Minimum recording duration in ms before transcribing. Shorter recordings are discarded. Default: 500 */
+  minDurationMs?: number
 }
 
 export interface UsePushToTalkReturn {
   isRecording: boolean
   isTranscribing: boolean
   isSupported: boolean
-  toggleRecording: () => void
+  startRecording: () => void
+  stopRecording: () => void
 }
 
 function getSupportedMimeType(): string | undefined {
@@ -24,7 +27,7 @@ function getSupportedMimeType(): string | undefined {
 }
 
 export function usePushToTalk(options: UsePushToTalkOptions): UsePushToTalkReturn {
-  const { onTranscript, onError } = options
+  const { onTranscript, onError, minDurationMs = 500 } = options
 
   const [isRecording, setIsRecording] = useState(false)
   const [isTranscribing, setIsTranscribing] = useState(false)
@@ -34,6 +37,7 @@ export function usePushToTalk(options: UsePushToTalkOptions): UsePushToTalkRetur
   const chunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const isMountedRef = useRef(true)
+  const recordingStartRef = useRef<number | null>(null)
 
   useEffect(() => {
     isMountedRef.current = true
@@ -83,6 +87,28 @@ export function usePushToTalk(options: UsePushToTalkOptions): UsePushToTalkRetur
     if (isMountedRef.current) setIsRecording(false)
   }, [])
 
+  const stopRecording = useCallback(() => {
+    const duration = recordingStartRef.current != null ? Date.now() - recordingStartRef.current : 0
+    recordingStartRef.current = null
+    if (duration < minDurationMs) {
+      // Too short — discard without transcribing
+      const recorder = mediaRecorderRef.current
+      if (recorder && recorder.state !== 'inactive') {
+        recorder.ondataavailable = null
+        recorder.onstop = null
+        try { recorder.stop() } catch (_) { /* */ }
+      }
+      mediaRecorderRef.current = null
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
+      if (isMountedRef.current) setIsRecording(false)
+      return
+    }
+    stopAndTranscribe()
+  }, [minDurationMs, stopAndTranscribe])
+
   const startRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -124,6 +150,7 @@ export function usePushToTalk(options: UsePushToTalkOptions): UsePushToTalkRetur
       }
 
       mediaRecorderRef.current = recorder
+      recordingStartRef.current = Date.now()
       recorder.start(250)
 
       if (isMountedRef.current) setIsRecording(true)
@@ -139,14 +166,6 @@ export function usePushToTalk(options: UsePushToTalkOptions): UsePushToTalkRetur
     }
   }, [onError, transcribe])
 
-  const toggleRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      stopAndTranscribe()
-    } else {
-      startRecording()
-    }
-  }, [startRecording, stopAndTranscribe])
-
   useEffect(() => {
     return () => {
       const recorder = mediaRecorderRef.current
@@ -161,5 +180,5 @@ export function usePushToTalk(options: UsePushToTalkOptions): UsePushToTalkRetur
     }
   }, [])
 
-  return { isRecording, isTranscribing, isSupported, toggleRecording }
+  return { isRecording, isTranscribing, isSupported, startRecording, stopRecording }
 }

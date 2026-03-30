@@ -44,6 +44,8 @@ interface Task {
   github_branch?: string
   github_pr_number?: number
   github_pr_state?: string
+  error_message?: string
+  retry_count?: number
 }
 
 interface Agent {
@@ -1051,6 +1053,29 @@ export function TaskBoardPanel() {
                     </div>
                   )}
 
+                  {/* Error / stale indicators */}
+                  {task.error_message && (
+                    <div className="mb-2 ml-5.5 flex items-center gap-1.5">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/20 text-orange-400 border border-orange-500/30 font-mono truncate max-w-full" title={task.error_message}>
+                        {task.error_message.length > 50 ? task.error_message.slice(0, 50) + '...' : task.error_message}
+                      </span>
+                    </div>
+                  )}
+                  {(task.retry_count ?? 0) > 0 && (
+                    <div className="mb-1 ml-5.5">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-400 font-mono">
+                        Retry {task.retry_count}/5
+                      </span>
+                    </div>
+                  )}
+                  {task.status === 'in_progress' && task.updated_at && (Math.floor(Date.now() / 1000) - task.updated_at > 600) && (
+                    <div className="mb-1 ml-5.5">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30 font-mono" title={`Last updated ${Math.floor((Date.now() / 1000 - task.updated_at) / 60)} min ago`}>
+                        Stale
+                      </span>
+                    </div>
+                  )}
+
                   {/* Footer: assignee, priority, timestamp */}
                   <div className="flex items-center justify-between gap-2 ml-5.5 mt-auto pt-2 border-t border-border/20">
                     <span className="flex items-center gap-1.5 min-w-0 text-xs text-muted-foreground">
@@ -1449,6 +1474,36 @@ function TaskDetailModal({
           ) : (
             <p className="text-foreground/80 mb-4">{t('noDescription')}</p>
           )}
+
+          {/* Error message alert */}
+          {task.error_message && (
+            <div className="mb-4 p-3 rounded-md bg-orange-500/10 border border-orange-500/30 text-sm text-orange-300 flex items-start justify-between gap-2">
+              <div>
+                <span className="font-medium">Dispatch error: </span>
+                {task.error_message}
+                {(task.retry_count ?? 0) > 0 && (
+                  <span className="ml-2 text-xs text-orange-400/70">({task.retry_count}/5 attempts)</span>
+                )}
+              </div>
+              {(task.status === 'in_progress' || task.status === 'assigned') && (
+                <button
+                  className="shrink-0 text-xs px-2 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 transition-colors"
+                  onClick={async (e) => {
+                    e.stopPropagation()
+                    await fetch(`/api/tasks/${task.id}`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ status: 'assigned', error_message: null }),
+                    })
+                    onClose()
+                  }}
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+
           <div className="flex gap-2 mt-4" role="tablist" aria-label={t('taskDetailTabs')}>
             {(['details', 'comments', 'quality'] as const).map(tab => (
               <Button

@@ -4,6 +4,19 @@ import { callOpenClawGateway } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
+import { checkGatewayReachable } from './gateway-health'
+import {
+  classifyTaskModel,
+  classifyDirectModel,
+  buildTaskPrompt,
+  parseReviewVerdict,
+  scoreAgentForTask,
+  isAgentRoutable,
+  shouldRequeueStaleTask,
+  ROLE_AFFINITY,
+  type TaskForClassification,
+  type AgentForScoring,
+} from './task-dispatch-utils'
 
 interface DispatchableTask {
   id: number
@@ -23,61 +36,6 @@ interface DispatchableTask {
   metadata: string | null
 }
 
-// ---------------------------------------------------------------------------
-// Model routing
-// ---------------------------------------------------------------------------
-
-/**
- * Classify a task's complexity and return the appropriate model ID to pass
- * to the OpenClaw gateway. Uses keyword signals on title + description.
- *
- * Tiers:
- *   ROUTINE  → cheap model (Haiku)   — file ops, status checks, formatting
- *   MODERATE → mid model  (Sonnet)   — code gen, summaries, analysis, drafts
- *   COMPLEX  → premium model (Opus)  — debugging, architecture, novel problems
- *
- * The caller may override this by setting agent.config.dispatchModel.
- */
-function classifyTaskModel(task: DispatchableTask): string | null {
-  // Allow per-agent config override
-  if (task.agent_config) {
-    try {
-      const cfg = JSON.parse(task.agent_config)
-      if (typeof cfg.dispatchModel === 'string' && cfg.dispatchModel) return cfg.dispatchModel
-    } catch { /* ignore */ }
-  }
-
-  const text = `${task.title} ${task.description ?? ''}`.toLowerCase()
-  const priority = task.priority?.toLowerCase() ?? ''
-
-  // Complex signals → Opus
-  const complexSignals = [
-    'debug', 'diagnos', 'architect', 'design system', 'security audit',
-    'root cause', 'investigate', 'incident', 'failure', 'broken', 'not working',
-    'refactor', 'migration', 'performance optim', 'why is',
-  ]
-  if (priority === 'critical' || complexSignals.some(s => text.includes(s))) {
-    return '9router/cc/claude-opus-4-6'
-  }
-
-  // Routine signals → Haiku
-  const routineSignals = [
-    'status check', 'health check', 'ping', 'list ', 'fetch ', 'format',
-    'rename', 'move file', 'read file', 'update readme', 'bump version',
-    'send message', 'post to', 'notify', 'summarize', 'translate',
-    'quick ', 'simple ', 'routine ', 'minor ',
-  ]
-  if (priority === 'low' && routineSignals.some(s => text.includes(s))) {
-    return '9router/cc/claude-haiku-4-5-20251001'
-  }
-  if (routineSignals.some(s => text.includes(s)) && priority !== 'high' && priority !== 'critical') {
-    return '9router/cc/claude-haiku-4-5-20251001'
-  }
-
-  // Default: let the agent's own configured model handle it (no override)
-  return null
-}
-
 /** Extract the gateway agent identifier from the agent's config JSON.
  *  Falls back to agent_name (display name) if openclawId is not set. */
 function resolveGatewayAgentId(task: DispatchableTask): string {
@@ -88,53 +46,6 @@ function resolveGatewayAgentId(task: DispatchableTask): string {
     } catch { /* ignore */ }
   }
   return task.agent_name
-}
-
-function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | null): string {
-  const ticket = task.ticket_prefix && task.project_ticket_no
-    ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
-    : `TASK-${task.id}`
-
-  // Check for a rich dispatch prompt in task metadata
-  let dispatchPrompt: string | null = null
-  if (task.metadata) {
-    try {
-      const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata
-      if (typeof meta?.dispatch_prompt === 'string' && meta.dispatch_prompt) {
-        dispatchPrompt = meta.dispatch_prompt
-      }
-    } catch { /* ignore parse errors */ }
-  }
-
-  const lines = [
-    'You have been assigned a task in Mission Control.',
-    '',
-    `**[${ticket}] ${task.title}**`,
-    `Priority: ${task.priority}`,
-  ]
-
-  if (task.tags && task.tags.length > 0) {
-    lines.push(`Tags: ${task.tags.join(', ')}`)
-  }
-
-  // Use dispatch_prompt as the primary instruction if available,
-  // falling back to description for backward compatibility
-  if (dispatchPrompt) {
-    lines.push('', dispatchPrompt)
-    // Include description as supplementary context if it adds info
-    if (task.description && task.description !== dispatchPrompt) {
-      lines.push('', '## Additional Context', task.description)
-    }
-  } else if (task.description) {
-    lines.push('', task.description)
-  }
-
-  if (rejectionFeedback) {
-    lines.push('', '## Previous Review Feedback', rejectionFeedback, '', 'Please address this feedback in your response.')
-  }
-
-  lines.push('', 'Complete this task and provide your response. Be concise and actionable.')
-  return lines.join('\n')
 }
 
 /** Extract first valid JSON object from raw stdout (handles surrounding text/warnings). */
@@ -186,54 +97,9 @@ function getAnthropicApiKey(): string | null {
   return (process.env.ANTHROPIC_API_KEY || '').trim() || null
 }
 
-function isGatewayAvailable(): boolean {
-  // Gateway is available if OpenClaw is installed OR a gateway is registered in the DB
-  if (config.openclawHome) return true
-  try {
-    const db = getDatabase()
-    const row = db.prepare('SELECT COUNT(*) as c FROM gateways').get() as { c: number } | undefined
-    return (row?.c ?? 0) > 0
-  } catch {
-    return false
-  }
-}
-
-function classifyDirectModel(task: DispatchableTask): string {
-  // Check per-agent config override first
-  if (task.agent_config) {
-    try {
-      const cfg = JSON.parse(task.agent_config)
-      if (typeof cfg.dispatchModel === 'string' && cfg.dispatchModel) {
-        // Strip gateway prefixes like "9router/cc/" to get bare model ID
-        return cfg.dispatchModel.replace(/^.*\//, '')
-      }
-    } catch { /* ignore */ }
-  }
-
-  const text = `${task.title} ${task.description ?? ''}`.toLowerCase()
-  const priority = task.priority?.toLowerCase() ?? ''
-
-  // Complex → Opus
-  const complexSignals = [
-    'debug', 'diagnos', 'architect', 'design system', 'security audit',
-    'root cause', 'investigate', 'incident', 'refactor', 'migration',
-  ]
-  if (priority === 'critical' || complexSignals.some(s => text.includes(s))) {
-    return 'claude-opus-4-6'
-  }
-
-  // Routine → Haiku
-  const routineSignals = [
-    'status check', 'health check', 'format', 'rename', 'summarize',
-    'translate', 'quick ', 'simple ', 'routine ', 'minor ',
-  ]
-  if (routineSignals.some(s => text.includes(s)) && priority !== 'high' && priority !== 'critical') {
-    return 'claude-haiku-4-5-20251001'
-  }
-
-  // Default → Sonnet
-  return 'claude-sonnet-4-6'
-}
+// isGatewayAvailable() replaced by checkGatewayReachable() from gateway-health.ts
+// which probes real connectivity via DB-cached health status instead of just
+// checking env vars.
 
 function getAgentSoulContent(task: DispatchableTask): string | null {
   try {
@@ -377,14 +243,6 @@ function buildReviewPrompt(task: ReviewableTask): string {
   return lines.join('\n')
 }
 
-function parseReviewVerdict(text: string): { status: 'approved' | 'rejected'; notes: string } {
-  const upper = text.toUpperCase()
-  const status = upper.includes('VERDICT: APPROVED') ? 'approved' as const : 'rejected' as const
-  const notesMatch = text.match(/NOTES:\s*(.+)/i)
-  const notes = notesMatch?.[1]?.trim().substring(0, 2000) || (status === 'approved' ? 'Quality check passed' : 'Quality check failed')
-  return { status, notes }
-}
-
 /**
  * Run Aegis quality reviews on tasks in 'review' status.
  * Uses an agent to evaluate the task resolution, then approves or rejects.
@@ -424,7 +282,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       const prompt = buildReviewPrompt(task)
       let agentResponse: AgentResponseParsed
 
-      if (!isGatewayAvailable() && getAnthropicApiKey()) {
+      if (!checkGatewayReachable().available && getAnthropicApiKey()) {
         // Direct Claude API review — no gateway needed
         const reviewTask: DispatchableTask = {
           id: task.id, title: task.title, description: task.description,
@@ -432,6 +290,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
           workspace_id: task.workspace_id, agent_name: 'aegis', agent_id: 0,
           agent_config: null, ticket_prefix: task.ticket_prefix,
           project_ticket_no: task.project_ticket_no, project_id: null,
+          metadata: null,
         }
         agentResponse = await callClaudeDirectly(reviewTask, prompt)
       } else {
@@ -444,9 +303,11 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
           idempotencyKey: `aegis-review-${task.id}-${Date.now()}`,
           deliver: false,
         }
+        // Use `openclaw agent` which works reliably on Windows (gateway call agent
+        // --params breaks due to JSON arg parsing on Windows).
         const finalResult = await runOpenClaw(
-          ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
-          { timeoutMs: 125_000 }
+          ['agent', '--agent', String(invokeParams.agentId), '--message', String(invokeParams.message), '--json', '--timeout', '300'],
+          { timeoutMs: 305_000 }
         )
         const finalPayload = parseGatewayJson(finalResult.stdout)
           ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
@@ -557,25 +418,27 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
 }
 
 /**
- * Requeue stale tasks stuck in 'in_progress' whose assigned agent is offline.
- * Prevents tasks from being permanently stuck when agents crash or disconnect.
+ * Requeue stale tasks stuck in 'in_progress' using tiered staleness thresholds.
+ * Thresholds vary by agent status: offline agents trigger fastest (10 min),
+ * idle agents at 20 min, active/busy agents at 30 min.
  */
 export async function requeueStaleTasks(): Promise<{ ok: boolean; message: string }> {
   const db = getDatabase()
   const now = Math.floor(Date.now() / 1000)
-  const staleThreshold = now - 10 * 60 // 10 minutes
+  // Widen the SQL window to 30 min (the max tier); fine-grained filtering happens in JS
+  const wideThreshold = now - 30 * 60
   const maxDispatchRetries = 5
 
   const staleTasks = db.prepare(`
-    SELECT t.id, t.title, t.assigned_to, t.dispatch_attempts, t.workspace_id,
+    SELECT t.id, t.title, t.assigned_to, t.dispatch_attempts, t.updated_at, t.workspace_id,
            a.status as agent_status, a.last_seen as agent_last_seen
     FROM tasks t
     LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     WHERE t.status = 'in_progress'
       AND t.updated_at < ?
-  `).all(staleThreshold) as Array<{
+  `).all(wideThreshold) as Array<{
     id: number; title: string; assigned_to: string | null; dispatch_attempts: number
-    workspace_id: number; agent_status: string | null; agent_last_seen: number | null
+    updated_at: number; workspace_id: number; agent_status: string | null; agent_last_seen: number | null
   }>
 
   if (staleTasks.length === 0) {
@@ -584,42 +447,46 @@ export async function requeueStaleTasks(): Promise<{ ok: boolean; message: strin
 
   let requeued = 0
   let failed = 0
+  let skipped = 0
 
   for (const task of staleTasks) {
-    // Only requeue if the agent is offline or unknown
-    const agentOffline = !task.agent_status || task.agent_status === 'offline'
-    if (!agentOffline) continue
+    const staleMinutes = Math.floor((now - task.updated_at) / 60)
+    const decision = shouldRequeueStaleTask(task.agent_status, staleMinutes)
+
+    if (!decision.requeue) {
+      skipped++
+      continue
+    }
 
     const newAttempts = (task.dispatch_attempts ?? 0) + 1
 
     if (newAttempts >= maxDispatchRetries) {
       db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?')
-        .run('failed', `Task stuck in_progress ${newAttempts} times — agent "${task.assigned_to}" offline. Moved to failed.`, newAttempts, now, task.id)
+        .run('failed', `Task stuck in_progress ${newAttempts} times — ${decision.reason}. Moved to failed.`, newAttempts, now, task.id)
 
       eventBus.broadcast('task.status_changed', {
         id: task.id,
         status: 'failed',
         previous_status: 'in_progress',
-        error_message: `Stale task — agent offline after ${newAttempts} attempts`,
+        error_message: `Stale task failed after ${newAttempts} attempts`,
         reason: 'stale_task_max_retries',
       })
 
       failed++
     } else {
       db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?')
-        .run('assigned', `Requeued: agent "${task.assigned_to}" went offline while task was in_progress`, newAttempts, now, task.id)
+        .run('assigned', `Requeued: ${decision.reason}`, newAttempts, now, task.id)
 
-      // Add a comment explaining the requeue
       db.prepare(`
         INSERT INTO comments (task_id, author, content, created_at, workspace_id)
         VALUES (?, 'scheduler', ?, ?, ?)
-      `).run(task.id, `Task requeued (attempt ${newAttempts}/${maxDispatchRetries}): agent "${task.assigned_to}" went offline while task was in_progress.`, now, task.workspace_id)
+      `).run(task.id, `Task requeued (attempt ${newAttempts}/${maxDispatchRetries}): ${decision.reason}`, now, task.workspace_id)
 
       eventBus.broadcast('task.status_changed', {
         id: task.id,
         status: 'assigned',
         previous_status: 'in_progress',
-        error_message: `Agent "${task.assigned_to}" went offline`,
+        error_message: decision.reason,
         reason: 'stale_task_requeue',
       })
 
@@ -631,8 +498,8 @@ export async function requeueStaleTasks(): Promise<{ ok: boolean; message: strin
   return {
     ok: true,
     message: total === 0
-      ? `Found ${staleTasks.length} stale task(s) but agents still online`
-      : `Requeued ${requeued}, failed ${failed} of ${staleTasks.length} stale task(s)`,
+      ? `Found ${staleTasks.length} stale task(s), ${skipped} below threshold`
+      : `Requeued ${requeued}, failed ${failed} of ${staleTasks.length} stale task(s)${skipped ? ` (${skipped} below threshold)` : ''}`,
   }
 }
 
@@ -676,6 +543,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       id: task.id,
       status: 'in_progress',
       previous_status: 'assigned',
+      assigned_to: task.assigned_to,
     })
 
     db_helpers.logActivity(
@@ -711,7 +579,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         : null
 
       let agentResponse: AgentResponseParsed
-      const useDirectApi = !isGatewayAvailable() && getAnthropicApiKey()
+      const useDirectApi = !checkGatewayReachable().available && getAnthropicApiKey()
 
       if (useDirectApi && !targetSession) {
         // Direct Claude API dispatch — no gateway needed
@@ -727,7 +595,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
             idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
             deliver: false,
           },
-          125_000,
+          305_000,
         )
         const status = String(sendResult?.status || '').toLowerCase()
         if (status !== 'started' && status !== 'ok' && status !== 'in_flight') {
@@ -754,12 +622,11 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         // Model routing is handled by agent config, not dispatch params.
         // if (dispatchModel) invokeParams.model = dispatchModel
 
-        // Use --expect-final to block until the agent completes and returns the full
-        // response payload (result.payloads[0].text). The two-step agent → agent.wait
-        // pattern only returns lifecycle metadata and never includes the agent's text.
+        // Use `openclaw agent` which works reliably on Windows (gateway call agent
+        // --params breaks due to JSON arg parsing on Windows).
         const finalResult = await runOpenClaw(
-          ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
-          { timeoutMs: 125_000 }
+          ['agent', '--agent', String(invokeParams.agentId), '--message', String(invokeParams.message), '--json', '--timeout', '300'],
+          { timeoutMs: 305_000 }
         )
         const finalPayload = parseGatewayJson(finalResult.stdout)
           ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
@@ -895,55 +762,6 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
   }
 }
 
-// ---------------------------------------------------------------------------
-// Auto-routing: assign inbox tasks to available agents
-// ---------------------------------------------------------------------------
-
-/** Role affinity mapping — which task keywords match which agent roles. */
-const ROLE_AFFINITY: Record<string, string[]> = {
-  coder: ['code', 'implement', 'build', 'fix', 'bug', 'test', 'unit test', 'refactor', 'feature', 'api', 'endpoint', 'function', 'class', 'module', 'component', 'deploy', 'ci', 'pipeline'],
-  researcher: ['research', 'investigate', 'analyze', 'compare', 'find', 'discover', 'audit', 'review', 'survey', 'benchmark', 'evaluate', 'assess', 'competitor', 'market', 'trend'],
-  reviewer: ['review', 'audit', 'check', 'verify', 'validate', 'quality', 'security', 'compliance', 'approve'],
-  tester: ['test', 'qa', 'e2e', 'integration test', 'regression', 'coverage', 'verify', 'validate'],
-  devops: ['deploy', 'infrastructure', 'ci', 'cd', 'docker', 'kubernetes', 'monitoring', 'pipeline', 'server', 'nginx', 'ssl'],
-  assistant: ['write', 'draft', 'summarize', 'translate', 'format', 'document', 'docs', 'readme', 'email', 'message', 'report'],
-  agent: [], // generic fallback
-}
-
-function scoreAgentForTask(
-  agent: { name: string; role: string; status: string; config: string | null },
-  taskText: string,
-): number {
-  // Offline agents can't take work
-  if (agent.status === 'offline' || agent.status === 'error' || agent.status === 'sleeping') return -1
-
-  const text = taskText.toLowerCase()
-  const keywords = ROLE_AFFINITY[agent.role] || []
-
-  let score = 0
-  // Role keyword match
-  for (const kw of keywords) {
-    if (text.includes(kw)) score += 10
-  }
-
-  // Idle agents get a bonus (prefer agents not currently busy)
-  if (agent.status === 'idle') score += 5
-
-  // Check agent capabilities from config
-  if (agent.config) {
-    try {
-      const cfg = JSON.parse(agent.config)
-      const caps = Array.isArray(cfg.capabilities) ? cfg.capabilities : []
-      for (const cap of caps) {
-        if (typeof cap === 'string' && text.includes(cap.toLowerCase())) score += 15
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Any non-offline agent gets at least 1 (can be a fallback)
-  return Math.max(score, 1)
-}
-
 /**
  * Auto-route inbox tasks to the best available agent.
  * Runs before dispatch — moves tasks from inbox → assigned.
@@ -965,82 +783,149 @@ export async function autoRouteInboxTasks(): Promise<{ ok: boolean; message: str
     return { ok: true, message: 'No inbox tasks to route' }
   }
 
-  // Get all non-hidden, non-offline agents
-  const agents = db.prepare(`
+  // Get all non-hidden agents for the roster prompt
+  const allAgents = db.prepare(`
     SELECT id, name, role, status, config
     FROM agents
-    WHERE hidden = 0 AND status NOT IN ('offline', 'error')
+    WHERE hidden = 0
     LIMIT 50
   `).all() as Array<{ id: number; name: string; role: string; status: string; config: string | null }>
 
-  if (agents.length === 0) {
+  if (allAgents.length === 0) {
     return { ok: true, message: `${inboxTasks.length} inbox task(s) but no available agents` }
   }
+
+  // Build agent roster for Bertha with specialties
+  const NON_ASSIGNABLE_ROLES = ['orchestrator', 'ops runner', 'personal assistant', 'counselor']
+  const assignableAgents = allAgents.filter(a => !NON_ASSIGNABLE_ROLES.includes(a.role))
+
+  // Agent specialty descriptions to help the orchestrator make informed routing decisions
+  const AGENT_SPECIALTIES: Record<string, string> = {
+    'Shakedown': 'Market research, product opportunity scanning, competitive analysis, app/micro-SaaS idea validation, indie hacker opportunities',
+    'Terrapin': 'Deep technical research, technology evaluations, fact-finding, architecture comparisons, course/tooling research',
+    'Stella': 'Work strategy, transformation planning, executive communication, org strategy, career positioning',
+    'Garcia': 'Software architecture, design documents, ADRs, migration patterns, code standards, technical training materials',
+  }
+  const rosterLines = assignableAgents.map(a => {
+    const specialty = AGENT_SPECIALTIES[a.name] || ''
+    return `- ${a.name} (${a.role})${specialty ? ` — Specialty: ${specialty}` : ''} — status: ${a.status}`
+  }).join('\n')
+
+  const orchestratorAgent = (process.env.MC_REVIEWER_AGENT || 'bertha-coordinator').trim()
 
   let routed = 0
   const now = Math.floor(Date.now() / 1000)
 
   for (const task of inboxTasks) {
-    const taskText = `${task.title} ${task.description || ''}`
-    let parsedTags: string[] = []
-    if (task.tags) {
-      try { parsedTags = JSON.parse(task.tags) } catch { /* ignore */ }
-    }
-    const fullText = `${taskText} ${parsedTags.join(' ')}`
+    const ticket = `TASK-${task.id}`
+    const routingPrompt = [
+      'You are the task orchestrator for Mission Control.',
+      'Analyze the following task and assign it to the best agent from the roster.',
+      '',
+      `**[${ticket}] ${task.title}**`,
+      task.description ? `Description: ${task.description}` : '',
+      task.priority ? `Priority: ${task.priority}` : '',
+      '',
+      '**Available agents:**',
+      rosterLines,
+      '',
+      'Respond with ONLY a JSON object (no markdown, no explanation):',
+      '{"assign_to": "<agent name exactly as listed>", "reason": "<one sentence why>"}',
+    ].filter(Boolean).join('\n')
 
-    // Score each agent
-    const scored = agents
-      .map(a => ({ agent: a, score: scoreAgentForTask(a, fullText) }))
-      .filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score)
+    try {
+      const result = await runOpenClaw(
+        ['agent', '--agent', orchestratorAgent, '--message', routingPrompt, '--json', '--timeout', '60'],
+        { timeoutMs: 65_000 }
+      )
+      const payload = parseGatewayJson(result.stdout)
+      const responseText = payload?.result?.payloads?.[0]?.text || result.stdout || ''
 
-    if (scored.length === 0) continue
+      // Parse Bertha's assignment response
+      let assignTo: string | null = null
+      let reason = ''
+      try {
+        // Try to extract JSON from the response
+        const jsonMatch = responseText.match(/\{[^}]*"assign_to"\s*:\s*"([^"]+)"[^}]*\}/)
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0])
+          assignTo = parsed.assign_to
+          reason = parsed.reason || ''
+        }
+      } catch { /* ignore parse errors */ }
 
-    const best = scored[0].agent
+      // Validate the assigned agent exists in roster
+      if (assignTo) {
+        const matchedAgent = assignableAgents.find(a =>
+          a.name.toLowerCase() === assignTo!.toLowerCase()
+        )
+        if (matchedAgent) {
+          db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ?, error_message = NULL WHERE id = ?')
+            .run('assigned', matchedAgent.name, now, task.id)
 
-    // Check capacity — skip agents with 3+ in-progress tasks
-    const inProgressCount = (db.prepare(
-      'SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND status = \'in_progress\' AND workspace_id = ?'
-    ).get(best.name, task.workspace_id) as { c: number }).c
+          db_helpers.logActivity('task_auto_routed', 'task', task.id, 'scheduler',
+            `Bertha assigned "${task.title}" to ${matchedAgent.name} (${matchedAgent.role}). Reason: ${reason}`,
+            { agent: matchedAgent.name, role: matchedAgent.role, reason, orchestrator: orchestratorAgent },
+            task.workspace_id)
 
-    if (inProgressCount >= 3) {
-      // Try next best agent
-      const alt = scored.find(s => {
-        const c = (db.prepare(
-          'SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND status = \'in_progress\' AND workspace_id = ?'
-        ).get(s.agent.name, task.workspace_id) as { c: number }).c
-        return c < 3
-      })
-      if (!alt) continue // all agents at capacity
-      db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ?')
-        .run('assigned', alt.agent.name, now, task.id)
+          eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: matchedAgent.name })
+          routed++
+          continue
+        }
+      }
+
+      // Fallback: if Bertha's response didn't parse or agent not found, use keyword scoring
+      logger.warn({ taskId: task.id, assignTo, responseText: responseText.substring(0, 200) },
+        'Orchestrator routing failed, falling back to keyword scoring')
+      const taskText = `${task.title} ${task.description || ''}`
+      const scored = assignableAgents
+        .map(a => ({ agent: a, score: scoreAgentForTask(a, taskText) }))
+        .filter(s => s.score > 0)
+        .sort((a, b) => b.score - a.score)
+
+      if (scored.length === 0) continue
+
+      const best = scored[0].agent
+      db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ?, error_message = ? WHERE id = ?')
+        .run('assigned', best.name, now, 'Fallback: keyword routing (orchestrator parse failed)', task.id)
 
       db_helpers.logActivity('task_auto_routed', 'task', task.id, 'scheduler',
-        `Auto-assigned "${task.title}" to ${alt.agent.name} (${alt.agent.role}, score: ${alt.score})`,
-        { agent: alt.agent.name, role: alt.agent.role, score: alt.score },
+        `Fallback: assigned "${task.title}" to ${best.name} (${best.role}, score: ${scored[0].score})`,
+        { agent: best.name, role: best.role, score: scored[0].score, fallback: true },
         task.workspace_id)
 
-      eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: alt.agent.name })
+      eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: best.name })
       routed++
       continue
+    } catch (err: any) {
+      // If orchestrator call fails entirely, fall back to keyword scoring
+      logger.error({ taskId: task.id, error: err.message }, 'Orchestrator dispatch failed, falling back to keyword scoring')
+      const taskText = `${task.title} ${task.description || ''}`
+      const scored = assignableAgents
+        .map(a => ({ agent: a, score: scoreAgentForTask(a, taskText) }))
+        .filter(s => s.score > 0)
+        .sort((a, b) => b.score - a.score)
+
+      if (scored.length === 0) continue
+
+      const best = scored[0].agent
+      db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ?, error_message = ? WHERE id = ?')
+        .run('assigned', best.name, now, `Fallback: ${err.message}`, task.id)
+
+      db_helpers.logActivity('task_auto_routed', 'task', task.id, 'scheduler',
+        `Fallback: assigned "${task.title}" to ${best.name} (orchestrator error: ${err.message})`,
+        { agent: best.name, role: best.role, fallback: true, error: err.message },
+        task.workspace_id)
+
+      eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: best.name })
+      routed++
     }
-
-    db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ?')
-      .run('assigned', best.name, now, task.id)
-
-    db_helpers.logActivity('task_auto_routed', 'task', task.id, 'scheduler',
-      `Auto-assigned "${task.title}" to ${best.name} (${best.role}, score: ${scored[0].score})`,
-      { agent: best.name, role: best.role, score: scored[0].score },
-      task.workspace_id)
-
-    eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: best.name })
-    routed++
   }
 
   return {
     ok: true,
     message: routed > 0
-      ? `Auto-routed ${routed}/${inboxTasks.length} inbox task(s)`
+      ? `Auto-routed ${routed}/${inboxTasks.length} inbox task(s) via orchestrator`
       : `${inboxTasks.length} inbox task(s), no suitable agents found`,
   }
 }

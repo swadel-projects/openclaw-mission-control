@@ -19,6 +19,7 @@ const AVATAR_IMAGES: Record<string, string> = {
   'bertha-coordinator': '/avatars/bertha.png',
   'garcia-architect': '/avatars/garcia.png',
   'roadie-ops': '/avatars/roadie.png',
+  'shakedown-researcher': '/avatars/shakedown.png',
 }
 
 function getInitials(name: string | undefined | null): string {

@@ -87,16 +87,16 @@ export async function POST(request: NextRequest) {
               idempotencyKey: `notification-${notification.id}-${Date.now()}`,
               deliver: false,
             };
+            // Use `openclaw agent` which works reliably on Windows
             const { stdout, stderr } = await runOpenClaw(
               [
-                'gateway',
-                'call',
                 'agent',
-                '--params',
-                JSON.stringify(invokeParams),
-                '--json'
+                '--agent', String(invokeParams.agentId),
+                '--message', String(invokeParams.message),
+                '--json',
+                '--timeout', '30'
               ],
-              { timeoutMs: 30000 }
+              { timeoutMs: 35000 }
             );
 
             if (stderr && stderr.includes('error')) {

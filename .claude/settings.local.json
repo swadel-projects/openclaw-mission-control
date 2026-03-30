@@ -4,26 +4,30 @@
       "Bash(curl -s https://api.github.com/repos/builderz-labs/mission-control/releases/tags/v2.0.0 | head -200)",
       "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && pnpm typecheck 2>&1 | tail -20)",
       "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && GIT_OPTIONAL_LOCKS=0 git status 2>&1 | head -10)",
-      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && cat src/app/\\\\[\\\\[...panel\\\\]\\\\]/page.tsx | head -60)",
-      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"spawn\" src/app/\\\\[\\\\[...panel\\\\]\\\\]/page.tsx | head -10)",
-      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"spawn\\\\|Spawn\" src/app/\\\\[\\\\[...panel\\\\]\\\\]/page.tsx | head -10)",
-      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"import.*Panel\\\\|case 'cron'\\\\|case 'webhooks'\\\\|case 'alerts'\" src/app/\\\\[\\\\[...panel\\\\]\\\\]/page.tsx | head -20)",
-      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"case 'cron'\\\\|case 'webhooks'\\\\|case 'alerts'\\\\|case 'spawn'\" src/app/\\\\[\\\\[...panel\\\\]\\\\]/page.tsx | head -10)",
+      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && cat src/app/\\[\\[...panel\\]\\]/page.tsx | head -60)",
+      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"spawn\" src/app/\\[\\[...panel\\]\\]/page.tsx | head -10)",
+      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"spawn\\|Spawn\" src/app/\\[\\[...panel\\]\\]/page.tsx | head -10)",
+      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"import.*Panel\\|case 'cron'\\|case 'webhooks'\\|case 'alerts'\" src/app/\\[\\[...panel\\]\\]/page.tsx | head -20)",
+      "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && grep -n \"case 'cron'\\|case 'webhooks'\\|case 'alerts'\\|case 'spawn'\" src/app/\\[\\[...panel\\]\\]/page.tsx | head -10)",
       "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && pnpm install 2>&1 | tail -10)",
       "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && pnpm typecheck 2>&1)",
       "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && pnpm typecheck 2>&1; echo \"EXIT: $?\")",
       "Bash(cd /c/Users/swade/Repos/openclaw-mission-control && pnpm lint 2>&1; echo \"EXIT: $?\")",
-      "Bash(git add:*)"
-    ]
-  }
-}
-
-{
-  "permissions": {
-    "allow": [
+      "Bash(git add:*)",
       "Bash(find /c/Users/swade/Repos/openclaw-mission-control -name tailwind.config.* -o -name next.config.*)",
       "Bash(ls -la /c/Users/swade/Repos/openclaw-mission-control/src/middleware.*)",
-      "Bash(pnpm typecheck:*)"
+      "Bash(pnpm typecheck:*)",
+      "Bash(xargs grep:*)",
+      "Bash(grep -r \"task-dispatch\\\\|task-dispatch.ts\" /c/Users/swade/Repos/openclaw-mission-control/tests --include=*.ts)",
+      "Bash(grep -r \"scheduler\\\\|scheduler.ts\" /c/Users/swade/Repos/openclaw-mission-control/tests --include=*.ts)",
+      "Bash(xargs wc:*)",
+      "Bash(npx vitest:*)",
+      "Bash(pnpm test:*)",
+      "Bash(node C:/nvm4w/nodejs/node_modules/openclaw/openclaw.mjs gateway agents)",
+      "Bash(node:*)"
     ]
-  }
+  },
+  "disabledMcpjsonServers": [
+    "gmail-send"
+  ]
 }
