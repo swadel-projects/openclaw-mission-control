@@ -20,6 +20,7 @@ interface DispatchableTask {
   project_ticket_no: number | null
   project_id: number | null
   tags?: string[]
+  metadata: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,17 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
     ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
     : `TASK-${task.id}`
 
+  // Check for a rich dispatch prompt in task metadata
+  let dispatchPrompt: string | null = null
+  if (task.metadata) {
+    try {
+      const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata
+      if (typeof meta?.dispatch_prompt === 'string' && meta.dispatch_prompt) {
+        dispatchPrompt = meta.dispatch_prompt
+      }
+    } catch { /* ignore parse errors */ }
+  }
+
   const lines = [
     'You have been assigned a task in Mission Control.',
     '',
@@ -105,7 +117,15 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
     lines.push(`Tags: ${task.tags.join(', ')}`)
   }
 
-  if (task.description) {
+  // Use dispatch_prompt as the primary instruction if available,
+  // falling back to description for backward compatibility
+  if (dispatchPrompt) {
+    lines.push('', dispatchPrompt)
+    // Include description as supplementary context if it adds info
+    if (task.description && task.description !== dispatchPrompt) {
+      lines.push('', '## Additional Context', task.description)
+    }
+  } else if (task.description) {
     lines.push('', task.description)
   }
 
@@ -314,14 +334,9 @@ interface ReviewableTask {
   project_ticket_no: number | null
 }
 
-function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
-  if (task.agent_config) {
-    try {
-      const cfg = JSON.parse(task.agent_config)
-      if (typeof cfg.openclawId === 'string' && cfg.openclawId) return cfg.openclawId
-    } catch { /* ignore */ }
-  }
-  return task.assigned_to || 'jarv'
+function resolveGatewayAgentIdForReview(_task: ReviewableTask): string {
+  // Use MC_REVIEWER_AGENT env var, defaulting to bertha-coordinator
+  return (process.env.MC_REVIEWER_AGENT || 'bertha-coordinator').trim()
 }
 
 function buildReviewPrompt(task: ReviewableTask): string {
@@ -735,7 +750,9 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         }
         // Route to appropriate model tier based on task complexity.
         // null = no override, agent uses its own configured default model.
-        if (dispatchModel) invokeParams.model = dispatchModel
+        // Note: OpenClaw gateway 'agent' command does not accept a 'model' param.
+        // Model routing is handled by agent config, not dispatch params.
+        // if (dispatchModel) invokeParams.model = dispatchModel
 
         // Use --expect-final to block until the agent completes and returns the full
         // response payload (result.payloads[0].text). The two-step agent → agent.wait

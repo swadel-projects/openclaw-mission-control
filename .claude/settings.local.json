@@ -17,3 +17,13 @@
     ]
   }
 }
+
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/swade/Repos/openclaw-mission-control -name tailwind.config.* -o -name next.config.*)",
+      "Bash(ls -la /c/Users/swade/Repos/openclaw-mission-control/src/middleware.*)",
+      "Bash(pnpm typecheck:*)"
+    ]
+  }
+}

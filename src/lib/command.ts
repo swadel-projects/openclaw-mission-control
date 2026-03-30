@@ -71,9 +71,40 @@ export function runCommand(
   })
 }
 
+/**
+ * Run an OpenClaw CLI command.
+ * On Windows, .cmd shims can't be spawned with shell:false (EINVAL),
+ * and shell:true mangles JSON args. So we spawn node.exe directly
+ * with the openclaw.mjs entry point.
+ *
+ * The CLI resolves config differently from MC:
+ *   CLI: $OPENCLAW_HOME is user home → looks for $HOME/.openclaw/openclaw.json
+ *   MC:  OPENCLAW_HOME is the state dir (.openclaw) → looks for $stateDir/openclaw.json
+ * We override OPENCLAW_HOME for the child process so the CLI finds the right config.
+ */
 export function runOpenClaw(args: string[], options: CommandOptions = {}) {
+  const isWindows = process.platform === 'win32'
+  const openclawEntry = process.env.OPENCLAW_ENTRY
+    || (isWindows ? 'C:\\nvm4w\\nodejs\\node_modules\\openclaw\\openclaw.mjs' : '')
+
+  // Fix env for child CLI: OPENCLAW_HOME should be user home, not state dir
+  const childEnv = {
+    ...process.env,
+    ...options.env,
+    OPENCLAW_HOME: process.env.OPENCLAW_CLI_HOME || require('os').homedir(),
+  }
+
+  if (isWindows && openclawEntry) {
+    return runCommand(process.execPath, [openclawEntry, ...args], {
+      ...options,
+      env: childEnv,
+      cwd: options.cwd || config.openclawStateDir || process.cwd()
+    })
+  }
+
   return runCommand(config.openclawBin, args, {
     ...options,
+    env: childEnv,
     cwd: options.cwd || config.openclawStateDir || process.cwd()
   })
 }

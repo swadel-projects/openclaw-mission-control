@@ -4,6 +4,7 @@ import Image from 'next/image'
 import { useRef, useEffect, useState, useCallback } from 'react'
 import { useMissionControl, type ChatAttachment } from '@/store'
 import { Button } from '@/components/ui/button'
+import { MicButton } from '@/components/ui/mic-button'
 
 interface ChatInputProps {
   onSend: (content: string, attachments?: ChatAttachment[]) => void
@@ -103,6 +104,13 @@ export function ChatInput({ onSend, onAbort, disabled, agents = [], isGenerating
       addFiles(imageItems)
     }
   }, [addFiles])
+
+  const handleTranscript = useCallback((text: string) => {
+    const current = chatInput
+    const separator = current && !current.endsWith(' ') ? ' ' : ''
+    setChatInput(current + separator + text)
+    textareaRef.current?.focus()
+  }, [chatInput, setChatInput])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (showMentions) {
@@ -287,6 +295,8 @@ export function ChatInput({ onSend, onAbort, disabled, agents = [], isGenerating
             e.target.value = ''
           }}
         />
+
+        <MicButton onTranscript={handleTranscript} disabled={disabled || isSendingMessage} />
 
         <textarea
           ref={textareaRef}
