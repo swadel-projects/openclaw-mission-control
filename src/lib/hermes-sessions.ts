@@ -59,12 +59,35 @@ function hasHermesCliBinary(): boolean {
     return hermesBinaryCache.installed
   }
 
-  const candidates = [process.env.HERMES_BIN, 'hermes-agent', 'hermes'].filter((v): v is string => Boolean(v && v.trim()))
+  // Check common install locations including the data directory's local bin.
+  // In Docker, HOME=/nonexistent so we also check dataDir as effective HOME.
+  const dataDir = require('node:path').resolve(config.dataDir || '.data')
+  const homeDir = config.homeDir || process.env.HOME || ''
+  const candidates = [
+    process.env.HERMES_BIN,
+    join(dataDir, '.local', 'bin', 'hermes'),
+    join(dataDir, '.hermes', 'hermes-agent', 'venv', 'bin', 'hermes'),
+    join(homeDir, '.local', 'bin', 'hermes'),
+    join(homeDir, '.hermes', 'hermes-agent', 'venv', 'bin', 'hermes'),
+    'hermes-agent',
+    'hermes',
+  ].filter((v): v is string => Boolean(v && v.trim()))
   const installed = candidates.some((bin) => {
     try {
-      const res = spawnSync(bin, ['--version'], { stdio: 'ignore', timeout: 1200 })
-      return res.status === 0
-    } catch {
+      // First check if the file exists (fast path for absolute paths)
+      if (bin.startsWith('/') && !existsSync(bin)) {
+        logger.debug({ bin }, 'hermes candidate not found on disk')
+        return false
+      }
+      // hermes CLI doesn't support --version (exits 2). Use --help as probe.
+      const res = spawnSync(bin, ['--help'], { stdio: 'pipe', timeout: 5000 })
+      const found = res.status === 0
+      if (found) {
+        logger.info({ bin, stdout: (res.stdout || '').toString().trim().slice(0, 60) }, 'hermes binary detected')
+      }
+      return found
+    } catch (err) {
+      logger.debug({ bin, err }, 'hermes candidate check failed')
       return false
     }
   })
@@ -82,14 +105,39 @@ export function isHermesInstalled(): boolean {
   return hasHermesCliBinary()
 }
 
+function parseGatewayPid(raw: string): number | null {
+  const text = raw.trim()
+  if (!text) return null
+
+  // Legacy/simple format: file contains only PID text
+  if (/^\d+$/.test(text)) {
+    const pid = Number.parseInt(text, 10)
+    return Number.isFinite(pid) && pid > 0 ? pid : null
+  }
+
+  // Current Hermes format: JSON object with pid field
+  try {
+    const parsed = JSON.parse(text) as { pid?: number | string } | null
+    const value = parsed?.pid
+    const pid = typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number.parseInt(value, 10)
+        : NaN
+    return Number.isFinite(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
 export function isHermesGatewayRunning(): boolean {
   const pidPath = getHermesPidPath()
   if (!existsSync(pidPath)) return false
 
   try {
-    const pidStr = readFileSync(pidPath, 'utf8').trim()
-    const pid = parseInt(pidStr, 10)
-    if (!Number.isFinite(pid) || pid <= 0) return false
+    const pidStr = readFileSync(pidPath, 'utf8')
+    const pid = parseGatewayPid(pidStr)
+    if (!pid) return false
     // Check if process exists (signal 0 doesn't kill, just checks)
     process.kill(pid, 0)
     return true

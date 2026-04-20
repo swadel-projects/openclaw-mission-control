@@ -6,6 +6,7 @@ interface CommandOptions {
   env?: NodeJS.ProcessEnv
   timeoutMs?: number
   input?: string
+  onData?: (chunk: string) => void
 }
 
 interface CommandResult {
@@ -37,11 +38,15 @@ export function runCommand(
     }
 
     child.stdout.on('data', (data) => {
-      stdout += data.toString()
+      const chunk = data.toString()
+      stdout += chunk
+      options.onData?.(chunk)
     })
 
     child.stderr.on('data', (data) => {
-      stderr += data.toString()
+      const chunk = data.toString()
+      stderr += chunk
+      options.onData?.(chunk)
     })
 
     child.on('error', (error) => {
@@ -87,11 +92,13 @@ export function runOpenClaw(args: string[], options: CommandOptions = {}) {
   const openclawEntry = process.env.OPENCLAW_ENTRY
     || (isWindows ? 'C:\\nvm4w\\nodejs\\node_modules\\openclaw\\openclaw.mjs' : '')
 
-  // Fix env for child CLI: OPENCLAW_HOME should be user home, not state dir
-  const childEnv = {
+  // Explicitly pass OPENCLAW_STATE_DIR so the CLI uses the exact resolved path.
+  // Also fix env for child CLI: OPENCLAW_HOME should be user home, not state dir.
+  const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
-    ...options.env,
+    OPENCLAW_STATE_DIR: config.openclawStateDir,
     OPENCLAW_HOME: process.env.OPENCLAW_CLI_HOME || require('os').homedir(),
+    ...options.env,
   }
 
   if (isWindows && openclawEntry) {

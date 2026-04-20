@@ -93,6 +93,9 @@ Path alias: `@/*` maps to `./src/*`
 
 ## Custom Agent Avatars
 
+Set `MISSION_CONTROL_DATA_DIR` env var to change the data location (defaults to `.data/`).
+Database path: defaults to `<MISSION_CONTROL_DATA_DIR>/mission-control.db`.
+
 Agent avatars are stored in `public/avatars/` as PNG files.
 
 The avatar mapping is in `src/components/ui/agent-avatar.tsx` in the `AVATAR_IMAGES` constant:

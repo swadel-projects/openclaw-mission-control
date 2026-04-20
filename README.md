@@ -221,25 +221,17 @@ Kanban board with six columns (inbox → assigned → in progress → review →
 
 Explore agent knowledge through the Memory Browser, filesystem-backed memory tree, and interactive relationship graph for sessions, memory chunks, and linked knowledge files.
 
-![Mission Control Memory Panel](docs/mission-control-memory.png)
-
 ### Skills Hub
 
 Browse, install, and manage agent skills from local directories and external registries (ClawdHub, skills.sh). Built-in security scanner checks for prompt injection, credential leaks, data exfiltration, obfuscated content, and dangerous shell commands before installation. Supports 5 skill roots across `~/.agents/skills`, `~/.codex/skills`, project-local directories, and `~/.openclaw/skills`.
-
-![Mission Control Skills Panel](docs/mission-control-skills.png)
 
 ### Cost Tracking
 
 Token usage dashboard with per-model breakdowns, trend charts, and cost analysis. Session-level granularity powered by Recharts.
 
-![Mission Control Cost Tracking](docs/mission-control-cost-tracking.png)
-
 ### Security Audit & Agent Trust
 
 Real-time posture scoring (0-100), secret detection across agent messages, MCP tool call auditing, injection attempt tracking, and per-agent trust scores. Hook profiles (minimal/standard/strict) let operators tune security strictness per deployment.
-
-![Mission Control Security Panel](docs/mission-control-security.png)
 
 ### Agent Eval Framework
 
@@ -248,8 +240,6 @@ Four-layer evaluation: output evals (task completion scoring against golden data
 ### Natural Language Recurring Tasks
 
 Create recurring tasks with natural language like "every morning at 9am" or "every 2 hours". The built-in schedule parser converts expressions to cron and stores them in task metadata. A template-clone pattern keeps the original as a template and spawns dated child tasks on schedule.
-
-![Mission Control Cron Panel](docs/mission-control-cron.png)
 
 ### Claude Code Integration
 
@@ -367,7 +357,9 @@ See [`.env.example`](.env.example) for the complete list. Key variables:
 | `AUTH_PASS` | No | Initial admin password (auto-generated if unset) |
 | `API_KEY` | No | API key for headless access (auto-generated if unset) |
 | `OPENCLAW_CONFIG_PATH` | No* | Absolute path to `openclaw.json` |
-| `OPENCLAW_STATE_DIR` | No* | OpenClaw state root (default: `~/.openclaw`) |
+| `OPENCLAW_STATE_DIR` | No* | Exact path to the OpenClaw state directory (default: `~/.openclaw`). Preferred over `OPENCLAW_HOME` — avoids double-nesting |
+| `OPENCLAW_HOME` | No* | Legacy alias — treated as *parent* home dir (`.openclaw` is appended). Use `OPENCLAW_STATE_DIR` when it already points to the state dir |
+| `MISSION_CONTROL_DATA_DIR` | No | Directory for all MC data files (DB, tokens, etc.). Use an absolute path with the standalone server to survive rebuilds. |
 | `MC_CLAUDE_HOME` | No | Path to `~/.claude` directory |
 | `MC_ALLOWED_HOSTS` | No | Host allowlist for production |
 | `NEXT_PUBLIC_GATEWAY_OPTIONAL` | No | Run without gateway connection |
